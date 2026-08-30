@@ -40,6 +40,18 @@ use crate::sync::{AtomicU32, AtomicU64};
 ///   record's commit word observed the producer's release store, so
 ///   plain (non-atomic) data access is race-free by protocol, not by
 ///   type.
+///
+/// Scope of that last argument: it holds for a protocol-abiding peer.
+/// A hostile peer can race these plain copies by scribbling
+/// concurrently, which the abstract memory model calls a data race; in
+/// practice such a race reads as torn bytes on cache-coherent
+/// hardware, every byte read from the log is treated as untrusted
+/// input by the consumer's structural validation, and no control flow
+/// in this crate branches on payload bytes. No tool verifies the
+/// hostile case end to end (loom models data words as relaxed atomics,
+/// and Miri only observes protocol-abiding schedules), so this stance
+/// is a documented assumption of the transport's threat model, not a
+/// machine-checked property.
 pub trait LogMemory {
     fn counter(&self, offset: usize) -> &AtomicU64;
     fn record_length_word(&self, data_offset: usize) -> &AtomicU32;

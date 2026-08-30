@@ -34,6 +34,7 @@ use thiserror::Error;
 use crate::layout::{
     ACTIVE_COUNT_OFFSET, CLEANED_CYCLES_OFFSET, CONSUMER_PARKED_OFFSET, LogGeometry,
     PRODUCER_PARKED_OFFSET, RAW_TAIL_OFFSETS, RECORD_HEADER_SIZE, REGION_COUNT,
+    assert_sound_geometry,
 };
 use crate::mem::LogMemory;
 use crate::record::{
@@ -69,8 +70,18 @@ impl<M: LogMemory> LogProducer<M> {
     /// The memory must satisfy the [`LogMemory`] contract for
     /// `geometry` and be all-zero (a fresh log); resuming an existing
     /// log is not supported.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a geometry no log can be sound over: a region
+    /// capacity that is not a power of two, that cannot hold a record,
+    /// or that exceeds [`crate::layout::MAX_REGION_CAPACITY`] (past
+    /// which a commit word could truncate to the not-committed
+    /// marker). Capacities below the production minimum are accepted
+    /// so tests can exercise boundaries cheaply; full validation is
+    /// [`LogGeometry::validate`].
     pub fn new(memory: M, geometry: LogGeometry) -> Self {
-        debug_assert!(geometry.region_capacity.is_power_of_two());
+        assert_sound_geometry(geometry);
         debug_assert_eq!(memory.data_len(), geometry.data_len());
         Self {
             memory,
@@ -148,13 +159,13 @@ impl<M: LogMemory> LogProducer<M> {
 
             self.cycle = next_cycle;
             self.tail_offset = 0;
-            debug_assert_eq!(
-                self.memory
-                    .record_length_word(self.active_region() * self.region_capacity)
-                    .load(Ordering::Relaxed),
-                0,
-                "rotated into a region that was not cleaned",
-            );
+            // Deliberately no freshness assertion on the entered
+            // region: the cleaned counter is peer-writable, so a
+            // hostile consumer lying about cleaning could otherwise
+            // panic this side in debug builds. Overwriting an
+            // un-zeroed region only loses records that lying consumer
+            // was owed; the loom rotation model covers the honest
+            // admission ordering.
             self.publish_tail();
             self.memory
                 .counter(ACTIVE_COUNT_OFFSET)
@@ -215,6 +226,9 @@ impl<M: LogMemory> LogProducer<M> {
 
     fn publish_tail(&self) {
         #[allow(clippy::cast_possible_truncation)]
+        // The packed format spends 32 bits on the cycle tag by design;
+        // nothing reads it for correctness today, and it must widen
+        // anyway before a multi-producer claim protocol ships.
         let packed = u64::from(self.cycle as u32) << 32 | self.tail_offset as u64;
         self.memory
             .counter(RAW_TAIL_OFFSETS[self.active_region()])

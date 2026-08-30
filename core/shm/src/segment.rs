@@ -17,11 +17,16 @@
 
 //! Anonymous shared segments and their mappings.
 //!
-//! A segment never has a filesystem name another process could open:
-//! `memfd_create` on Linux, an unlinked tmpfile elsewhere. The only
-//! way in is the fd, passed over the connection's unix socket, so
-//! segment lifetime is exactly fd lifetime and a crashed peer leaks
-//! nothing.
+//! A segment is reachable only through its fd, passed over the
+//! connection's unix socket, so segment lifetime is exactly fd
+//! lifetime and a crashed peer leaks nothing. On Linux the backing is
+//! `memfd_create` (nameless from birth) with shrink and grow sealed at
+//! creation, so a hostile peer holding the same fd cannot resize the
+//! backing pages out from under the honest side's mapping. Elsewhere
+//! the backing is a tmpfile in the per-user temp directory, unlinked
+//! immediately after creation; that platform has no sealing API, which
+//! is one of the reasons non-Linux targets are a development platform,
+//! not a hardened deployment target.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -40,30 +45,44 @@ pub struct AnonymousSegment {
 }
 
 impl AnonymousSegment {
-    /// Creates a fresh zero-filled segment of `len` bytes.
+    /// Creates a fresh zero-filled segment of `len` bytes, fully
+    /// provisioned, and (on Linux) sealed against resizing.
     ///
     /// # Errors
     ///
     /// Returns the underlying OS error when the backing fd cannot be
-    /// created or sized.
+    /// created, sized, provisioned, or sealed, or
+    /// [`io::ErrorKind::InvalidInput`] when `len` does not fit the
+    /// platform's `off_t`.
     pub fn allocate(len: usize) -> io::Result<Self> {
         let fd = create_anonymous_fd()?;
-        #[allow(clippy::cast_possible_wrap)]
-        // Segment sizes are far below off_t's positive range.
-        let truncated = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
-        if truncated < 0 {
+        let file_len = off_t_len(len)?;
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), file_len) } < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Provision the pages now so exhaustion surfaces here as an
+        // error instead of as SIGBUS on the first touch of a sparse
+        // hole mid-append.
+        preallocate(&fd, file_len)?;
+        seal_resizing(&fd)?;
         Ok(Self { fd, len })
     }
 
     /// Adopts an fd received from the peer, refusing one whose size
-    /// disagrees with the negotiated layout.
+    /// disagrees with the negotiated layout or (on Linux) one whose
+    /// backing is not sealed against resizing.
+    ///
+    /// The seal requirement doubles as a provenance check on Linux:
+    /// only memfd-style backings support seals at all, so a regular
+    /// file or a fd from a hostile filesystem is rejected outright.
+    /// The size check alone is inherently TOCTOU; the seals are what
+    /// make it durable.
     ///
     /// # Errors
     ///
-    /// Returns the underlying OS error when the fd cannot be stat'ed,
-    /// or [`io::ErrorKind::InvalidData`] on a size mismatch.
+    /// Returns the underlying OS error when the fd cannot be
+    /// inspected, or [`io::ErrorKind::InvalidData`] on a size
+    /// mismatch or missing seals.
     pub fn from_received_fd(fd: OwnedFd, expected_len: usize) -> io::Result<Self> {
         // Safety: zeroed stat buffer is a valid out-parameter.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -79,6 +98,7 @@ impl AnonymousSegment {
                 ),
             ));
         }
+        require_resize_seals(&fd)?;
         Ok(Self {
             fd,
             len: expected_len,
@@ -132,11 +152,16 @@ impl SegmentMapping {
         if std::ptr::eq(base, libc::MAP_FAILED) {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self {
+        let mapping = Self {
             base: NonNull::new(base.cast::<u8>())
                 .ok_or_else(|| io::Error::other("mmap returned a null mapping"))?,
             len: segment.len,
-        })
+        };
+        // A forked child inheriting this writable mapping would be a
+        // third party on a log whose contract allows exactly two;
+        // exclude the range from fork inheritance.
+        exclude_from_fork(&mapping)?;
+        Ok(mapping)
     }
 
     #[must_use]
@@ -200,8 +225,12 @@ impl SegmentMapping {
         data_offset: usize,
         data_len: usize,
     ) -> RawLogMemory {
-        assert!(counters_offset + crate::layout::COUNTERS_BLOCK_SIZE <= self.len);
-        assert!(data_offset + data_len <= self.len);
+        // Subtraction form so a huge offset cannot wrap the addition
+        // into a passing comparison on 32-bit targets.
+        assert!(crate::layout::COUNTERS_BLOCK_SIZE <= self.len);
+        assert!(counters_offset <= self.len - crate::layout::COUNTERS_BLOCK_SIZE);
+        assert!(data_len <= self.len);
+        assert!(data_offset <= self.len - data_len);
         // Safety: in-bounds per the asserts; validity and exclusivity
         // are the caller's contract, forwarded from the public unsafe
         // constructors.
@@ -226,9 +255,23 @@ impl Drop for SegmentMapping {
     }
 }
 
+fn off_t_len(len: usize) -> io::Result<libc::off_t> {
+    libc::off_t::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("segment of {len} bytes exceeds this platform's file offset range"),
+        )
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn create_anonymous_fd() -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::memfd_create(c"iggy-shm".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe {
+        libc::memfd_create(
+            c"iggy-shm".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -236,6 +279,10 @@ fn create_anonymous_fd() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// No memfd outside Linux: an unlinked tmpfile gives the same
+/// anonymous lifetime after a brief named window in the per-user temp
+/// directory (0700, same uid), which is why this stays the
+/// development path rather than a hardened one.
 #[cfg(not(target_os = "linux"))]
 fn create_anonymous_fd() -> io::Result<OwnedFd> {
     let template = env::temp_dir().join("iggy-shm-XXXXXX");
@@ -247,15 +294,110 @@ fn create_anonymous_fd() -> io::Result<OwnedFd> {
     }
     // Safety: mkstemp returned a fresh owned fd.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // Unlink immediately: the segment must never be openable by name,
-    // and the kernel reclaims it once the last fd and mapping close.
     if unsafe { libc::unlink(template_bytes.as_ptr().cast::<libc::c_char>()) } < 0 {
         return Err(io::Error::last_os_error());
     }
+    // The libc crate binds no mkostemp on this platform, so
+    // close-on-exec arrives one call late; a fork+exec racing this
+    // window inherits the fd. Accepted on the development platform.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+/// Pre-fault the whole backing so ENOSPC/ENOMEM surface at allocation
+/// time as an error instead of as SIGBUS on first touch.
+#[cfg(target_os = "linux")]
+fn preallocate(fd: &OwnedFd, file_len: libc::off_t) -> io::Result<()> {
+    if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, file_len) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// No fallocate outside Linux; the tmpfile stays sparse and pressure
+/// surfaces as SIGBUS on first touch, accepted on the development
+/// platform.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+// Signature parity with the Linux implementation.
+fn preallocate(_fd: &OwnedFd, _file_len: libc::off_t) -> io::Result<()> {
+    Ok(())
+}
+
+/// Seal the backing against resizing, and against further seals, so
+/// the peer holding the same fd can neither shrink the pages out from
+/// under the honest side's mapping (SIGBUS) nor add a write seal of
+/// its own.
+#[cfg(target_os = "linux")]
+fn seal_resizing(fd: &OwnedFd) -> io::Result<()> {
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+// Signature parity with the Linux implementation.
+fn seal_resizing(_fd: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_resize_seals(fd: &OwnedFd) -> io::Result<()> {
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        // Regular files and most filesystems do not support seals at
+        // all, so this branch also rejects an fd of the wrong kind.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment fd does not support seals; not an acceptable backing",
+        ));
+    }
+    if seals & (libc::F_SEAL_SHRINK | libc::F_SEAL_GROW) != libc::F_SEAL_SHRINK | libc::F_SEAL_GROW
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("segment fd is not sealed against resizing (seals {seals:#x})"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+// Signature parity with the Linux implementation.
+fn require_resize_seals(_fd: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exclude_from_fork(mapping: &SegmentMapping) -> io::Result<()> {
+    let advised = unsafe {
+        libc::madvise(
+            mapping.base.as_ptr().cast::<libc::c_void>(),
+            mapping.len,
+            libc::MADV_DONTFORK,
+        )
+    };
+    if advised < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The libc crate binds no minherit on this platform, so a forked
+/// child does inherit the mapping here. Accepted on the development
+/// platform; the two-party contract is enforced by `MADV_DONTFORK`
+/// only on Linux.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+// Signature parity with the Linux implementation.
+fn exclude_from_fork(_mapping: &SegmentMapping) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,6 +405,48 @@ mod tests {
     use super::*;
     use crate::layout::{LogGeometry, MIN_REGION_CAPACITY, SEGMENT_PAGE_SIZE};
     use crate::mem::LogMemory;
+
+    #[test]
+    #[cfg_attr(miri, ignore = "miri cannot map file-backed segments")]
+    fn received_fd_with_matching_size_is_adopted() {
+        let segment = AnonymousSegment::allocate(SEGMENT_PAGE_SIZE).unwrap();
+        let cloned = segment.as_fd().try_clone_to_owned().unwrap();
+        let adopted = AnonymousSegment::from_received_fd(cloned, SEGMENT_PAGE_SIZE).unwrap();
+        assert_eq!(adopted.len(), SEGMENT_PAGE_SIZE);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "miri cannot operate on file-backed segments")]
+    fn seals_block_peer_resizing() {
+        let segment = AnonymousSegment::allocate(SEGMENT_PAGE_SIZE).unwrap();
+        let _mapping = SegmentMapping::map(&segment).unwrap();
+
+        // The hostile-peer move: shrink the backing after both sides
+        // mapped. The creation-time seal must refuse it.
+        let shrunk = unsafe { libc::ftruncate(segment.as_fd().as_raw_fd(), 0) };
+        assert_eq!(shrunk, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "miri cannot operate on file-backed segments")]
+    fn unsealed_fd_is_rejected_on_adoption() {
+        let raw_fd =
+            unsafe { libc::memfd_create(c"iggy-shm-unsealed".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw_fd >= 0);
+        // Safety: memfd_create returned a fresh owned fd.
+        let unsealed = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let file_len = libc::off_t::try_from(SEGMENT_PAGE_SIZE).unwrap();
+        assert_eq!(
+            unsafe { libc::ftruncate(unsealed.as_raw_fd(), file_len) },
+            0
+        );
+
+        let error = AnonymousSegment::from_received_fd(unsealed, SEGMENT_PAGE_SIZE).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     #[cfg_attr(miri, ignore = "miri cannot map file-backed segments")]
