@@ -349,6 +349,22 @@ impl Validatable<ConfigurationError> for ServerConfig {
             format!("{COMPONENT} (error: {e}) - failed to validate quic config")
         })?;
 
+        self.shm.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate shm config")
+        })?;
+
+        // The shared-memory plane feeds decoded frames into the same bus
+        // dispatch as every other transport, so its frame ceiling must not
+        // admit messages the bus read-side validator rejects.
+        if self.shm.enabled && self.shm.max_message_size.as_bytes_u64() > bus_max_message_size {
+            eprintln!(
+                "{COMPONENT} shm.max_message_size ({}) exceeds message_bus.max_message_size ({})",
+                self.shm.max_message_size.as_bytes_u64(),
+                bus_max_message_size
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         // Both knobs below sit on shared section structs, so the rejects live
         // here rather than in those types' own `Validatable` impls. `0` /
         // `disabled` / `unlimited` all parse to the same zero duration.

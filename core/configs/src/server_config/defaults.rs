@@ -33,6 +33,7 @@ use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::ServerConfig;
 use super::server::ServerSystemConfig;
+use super::shm::ShmConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
@@ -57,6 +58,7 @@ impl Default for ServerConfig {
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
+            shm: ShmConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
@@ -260,6 +262,21 @@ impl Default for WebSocketTlsConfig {
             self_signed: SERVER_CONFIG.websocket.tls.self_signed,
             cert_file: SERVER_CONFIG.websocket.tls.cert_file.parse().unwrap(),
             key_file: SERVER_CONFIG.websocket.tls.key_file.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for ShmConfig {
+    fn default() -> ShmConfig {
+        // Read every field from the embedded TOML so the Default impl
+        // and the on-disk schema cannot drift.
+        ShmConfig {
+            enabled: SERVER_CONFIG.shm.enabled,
+            socket: SERVER_CONFIG.shm.socket.parse().unwrap(),
+            region_capacity: SERVER_CONFIG.shm.region_capacity.parse().unwrap(),
+            max_message_size: SERVER_CONFIG.shm.max_message_size.parse().unwrap(),
+            max_connections: u32::try_from(SERVER_CONFIG.shm.max_connections)
+                .expect("static_toml shm.max_connections must fit in u32"),
         }
     }
 }

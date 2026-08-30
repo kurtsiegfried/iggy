@@ -50,13 +50,15 @@ pub(crate) fn verify_request_checksum(
 }
 
 /// Map the transport kind to the legacy wire discriminant
-/// (`1=TCP, 2=QUIC, 4=WebSocket`); TLS variants report their base
-/// transport. `ClientTransportKind` is `#[non_exhaustive]`, so any other
-/// (TCP, TCP-TLS, or a future) variant falls back to TCP.
+/// (`1=TCP, 2=QUIC, 4=WebSocket, 5=shared memory`; 3 was never
+/// assigned); TLS variants report their base transport.
+/// `ClientTransportKind` is `#[non_exhaustive]`, so any other (TCP,
+/// TCP-TLS, or a future) variant falls back to TCP.
 pub(crate) const fn transport_kind_to_wire(kind: ClientTransportKind) -> u8 {
     match kind {
         ClientTransportKind::Quic => 2,
         ClientTransportKind::Ws | ClientTransportKind::Wss => 4,
+        ClientTransportKind::Shm => 5,
         _ => 1,
     }
 }

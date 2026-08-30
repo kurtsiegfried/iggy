@@ -36,6 +36,11 @@ pub enum ClientTransportKind {
     Ws,
     Wss,
     Quic,
+    /// Shared-memory logs over a unix-socket control channel. The
+    /// stored `peer_addr` is a loopback placeholder: a unix socket has
+    /// no inet address, and peer identity lives in the segment's
+    /// control page (pid + start time).
+    Shm,
 }
 
 /// TLS handshake details for [`ClientTransportKind::TcpTls`] and

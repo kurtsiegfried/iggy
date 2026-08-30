@@ -21,6 +21,7 @@ use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
+use super::shm::ShmConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
@@ -118,6 +119,8 @@ pub struct ServerConfig {
     pub tcp: TcpConfig,
     pub http: HttpConfig,
     pub websocket: WebSocketConfig,
+    #[serde(default)]
+    pub shm: ShmConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
     pub metadata: MetadataConfig,
