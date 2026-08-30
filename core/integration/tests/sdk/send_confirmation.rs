@@ -78,8 +78,8 @@ fn sole_confirmation(response: &SendMessagesResponse) -> &SendMessagesConfirmati
 }
 
 /// Each transport carries the reply body on its own path, so the full
-/// confirmation shape is pinned on all three.
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+/// confirmation shape is pinned on every transport.
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic, Shm])]
 async fn given_explicit_partition_when_sending_two_batches_should_confirm_advancing_base_offset(
     harness: &TestHarness,
 ) {

@@ -113,6 +113,18 @@ impl ClientConfig {
             .build()
     }
 
+    pub fn shm() -> Self {
+        Self::builder().transport(TransportProtocol::Shm).build()
+    }
+
+    /// Creates a shared-memory client that auto-logins as root after connect.
+    pub fn root_shm() -> Self {
+        Self::builder()
+            .transport(TransportProtocol::Shm)
+            .auto_login(AutoLoginConfig::root())
+            .build()
+    }
+
     pub fn with_nodelay(mut self) -> Self {
         self.tcp_nodelay = true;
         self

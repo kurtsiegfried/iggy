@@ -205,6 +205,10 @@ fn transport_port(node: &ClusterNode, transport: TransportProtocol) -> u16 {
         TransportProtocol::Quic => node.endpoints.quic,
         TransportProtocol::Http => node.endpoints.http,
         TransportProtocol::WebSocket => node.endpoints.websocket,
+        // A shared-memory socket only reaches the local node; the
+        // roster has no dialable shm endpoints, so no leader-aware
+        // caller passes this transport here.
+        TransportProtocol::Shm => 0,
     }
 }
 

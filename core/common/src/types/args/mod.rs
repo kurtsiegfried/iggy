@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser, Debug, Clone, Deserialize, Serialize, Default)]
 #[command(author, version, about, long_about = None)]
 pub struct ArgsOptional {
-    /// The transport to use. Valid values are `quic`, `http`, `tcp` and `ws`
+    /// The transport to use. Valid values are `quic`, `http`, `tcp`, `ws` and `shm`
     ///
     /// [default: tcp]
     #[arg(long)]
@@ -218,12 +218,33 @@ pub struct ArgsOptional {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_reconnection_interval: Option<String>,
+
+    /// The optional socket path for the shared-memory transport
+    ///
+    /// [default: local_data/runtime/iggy-shm.sock]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shm_socket: Option<String>,
+
+    /// The optional number of max reconnect retries for the shared-memory transport
+    ///
+    /// [default: 10]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shm_reconnection_max_retries: Option<u32>,
+
+    /// The optional reconnect interval for the shared-memory transport
+    ///
+    /// [default: "1s"]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shm_reconnection_interval: Option<String>,
 }
 
 /// The arguments used by the `ClientProviderConfig` to create a client.
 #[derive(Debug, Clone)]
 pub struct Args {
-    /// The transport to use. Valid values are `quic`, `http`, `tcp` and `ws`
+    /// The transport to use. Valid values are `quic`, `http`, `tcp`, `ws` and `shm`
     pub transport: String,
 
     /// Optional encryption key for the message payload used by the client
@@ -351,12 +372,31 @@ pub struct Args {
 
     /// The optional TLS validate certificate for the WebSocket transport
     pub websocket_tls_validate_certificate: bool,
+
+    /// The optional socket path for the shared-memory transport
+    pub shm_socket: String,
+
+    /// Whether to reconnect the shared-memory transport when disconnected
+    pub shm_reconnection_enabled: bool,
+
+    /// The optional number of maximum reconnect retries for the shared-memory transport
+    pub shm_reconnection_max_retries: Option<u32>,
+
+    /// The optional reconnect interval for the shared-memory transport
+    pub shm_reconnection_interval: String,
+
+    /// The optional re-establish after last connection interval for shared memory
+    pub shm_reconnection_reestablish_after: String,
+
+    /// The optional heartbeat interval for the shared-memory transport
+    pub shm_heartbeat_interval: String,
 }
 
 const QUIC_TRANSPORT: &str = "quic";
 const HTTP_TRANSPORT: &str = "http";
 const TCP_TRANSPORT: &str = "tcp";
 const WEBSOCKET_TRANSPORT: &str = "websocket";
+const SHM_TRANSPORT: &str = "shm";
 
 impl Args {
     pub fn get_server_address(&self) -> Option<String> {
@@ -365,6 +405,7 @@ impl Args {
             HTTP_TRANSPORT => Some(self.http_api_url.clone().replace("http://", "")),
             TCP_TRANSPORT => Some(self.tcp_server_address.clone()),
             WEBSOCKET_TRANSPORT => Some(self.websocket_server_address.clone()),
+            SHM_TRANSPORT => Some(self.shm_socket.clone()),
             _ => None,
         }
     }
@@ -416,6 +457,12 @@ impl Default for Args {
             websocket_tls_domain: "localhost".to_string(),
             websocket_tls_ca_file: None,
             websocket_tls_validate_certificate: false,
+            shm_socket: "local_data/runtime/iggy-shm.sock".to_string(),
+            shm_reconnection_enabled: true,
+            shm_reconnection_max_retries: Some(10),
+            shm_reconnection_interval: "1s".to_string(),
+            shm_reconnection_reestablish_after: "5s".to_string(),
+            shm_heartbeat_interval: "5s".to_string(),
         }
     }
 }
@@ -516,6 +563,15 @@ impl From<Vec<ArgsOptional>> for Args {
                 optional_args.websocket_reconnection_interval
             {
                 args.websocket_reconnection_interval = websocket_reconnection_interval;
+            }
+            if let Some(shm_socket) = optional_args.shm_socket {
+                args.shm_socket = shm_socket;
+            }
+            if let Some(shm_reconnection_retries) = optional_args.shm_reconnection_max_retries {
+                args.shm_reconnection_max_retries = Some(shm_reconnection_retries);
+            }
+            if let Some(shm_reconnection_interval) = optional_args.shm_reconnection_interval {
+                args.shm_reconnection_interval = shm_reconnection_interval;
             }
         }
 

@@ -112,6 +112,7 @@ pub enum Transport {
     WebSocket,
     WebSocketTlsSelfSigned,
     WebSocketTlsGenerated,
+    Shm,
 }
 
 impl Transport {
@@ -125,6 +126,7 @@ impl Transport {
             Transport::WebSocket => "websocket",
             Transport::WebSocketTlsSelfSigned => "websocket_tls_self_signed",
             Transport::WebSocketTlsGenerated => "websocket_tls_generated",
+            Transport::Shm => "shm",
         }
     }
 
@@ -136,6 +138,7 @@ impl Transport {
             Transport::WebSocket
             | Transport::WebSocketTlsSelfSigned
             | Transport::WebSocketTlsGenerated => "WebSocket",
+            Transport::Shm => "Shm",
         };
         Ident::new(name, Span::call_site())
     }
@@ -148,6 +151,7 @@ impl Transport {
             Transport::WebSocket
             | Transport::WebSocketTlsSelfSigned
             | Transport::WebSocketTlsGenerated => "root_websocket",
+            Transport::Shm => "root_shm",
         }
     }
 
@@ -376,6 +380,7 @@ fn parse_transport_ident(ident: Ident) -> syn::Result<Transport> {
         "WebSocket" => Ok(Transport::WebSocket),
         "WebSocketTlsSelfSigned" => Ok(Transport::WebSocketTlsSelfSigned),
         "WebSocketTlsGenerated" => Ok(Transport::WebSocketTlsGenerated),
+        "Shm" => Ok(Transport::Shm),
         other => Err(syn::Error::new(
             ident.span(),
             format!("unknown transport: {other}"),

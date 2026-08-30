@@ -38,8 +38,8 @@ use crate::harness::config::{AutoLoginConfig, TlsConfig};
 use crate::harness::error::TestBinaryError;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
-    Client, HttpClientConfig, IggyClient, IggyDuration, QuicClientConfig, TcpClient,
-    TcpClientConfig, UserClient, WebSocketClientConfig,
+    Client, HttpClientConfig, IggyClient, IggyDuration, QuicClientConfig, ShmClient,
+    ShmClientConfig, TcpClient, TcpClientConfig, UserClient, WebSocketClientConfig,
 };
 use iggy::quic::quic_client::QuicClient;
 use iggy::websocket::websocket_client::WebSocketClient;
@@ -55,6 +55,7 @@ pub struct ServerConnection {
     pub http_addr: Option<SocketAddr>,
     pub quic_addr: Option<SocketAddr>,
     pub websocket_addr: Option<SocketAddr>,
+    pub shm_socket: Option<PathBuf>,
     pub tls: Option<TlsConfig>,
     pub websocket_tls: Option<TlsConfig>,
     pub tls_ca_cert_path: Option<PathBuf>,
@@ -134,6 +135,7 @@ impl ClientBuilder {
             TransportProtocol::Http => self.create_http_client().await?,
             TransportProtocol::Quic => self.create_quic_client().await?,
             TransportProtocol::WebSocket => self.create_websocket_client().await?,
+            TransportProtocol::Shm => self.create_shm_client().await?,
         };
 
         if let Some(ref login) = self.auto_login
@@ -325,6 +327,46 @@ impl ClientBuilder {
         ))
     }
 
+    async fn create_shm_client(&self) -> Result<IggyClient, TestBinaryError> {
+        let socket =
+            self.connection
+                .shm_socket
+                .as_ref()
+                .ok_or_else(|| TestBinaryError::InvalidState {
+                    message: "Shm transport not available".to_string(),
+                })?;
+
+        let mut config = ShmClientConfig {
+            server_address: socket.display().to_string(),
+            auto_login: self.binary_auto_login(),
+            ..ShmClientConfig::default()
+        };
+        if let Some(reestablish_after) = self.reestablish_after {
+            config.reconnection.reestablish_after = reestablish_after;
+        }
+
+        let client =
+            ShmClient::create(Arc::new(config)).map_err(|e| TestBinaryError::ClientCreation {
+                transport: "Shm".to_string(),
+                address: socket.display().to_string(),
+                source: e.to_string(),
+            })?;
+
+        Client::connect(&client)
+            .await
+            .map_err(|e| TestBinaryError::ClientConnection {
+                transport: "Shm".to_string(),
+                address: socket.display().to_string(),
+                source: e.to_string(),
+            })?;
+
+        Ok(IggyClient::create(
+            iggy::prelude::ClientWrapper::Shm(client),
+            None,
+            self.encryptor.clone(),
+        ))
+    }
+
     fn binary_auto_login(&self) -> AutoLogin {
         if !self.reconnecting_login {
             return AutoLogin::Disabled;
@@ -361,6 +403,12 @@ impl ClientBuilder {
                 .websocket_addr
                 .map(|a| a.to_string())
                 .unwrap_or_default(),
+            TransportProtocol::Shm => self
+                .connection
+                .shm_socket
+                .as_ref()
+                .map(|socket| socket.display().to_string())
+                .unwrap_or_default(),
         }
     }
 }
@@ -375,6 +423,7 @@ mod tests {
             http_addr: Some("127.0.0.1:8081".parse().unwrap()),
             quic_addr: Some("127.0.0.1:8082".parse().unwrap()),
             websocket_addr: Some("127.0.0.1:8083".parse().unwrap()),
+            shm_socket: Some(PathBuf::from("/tmp/iggy-shm-test.sock")),
             tls: None,
             websocket_tls: None,
             tls_ca_cert_path: None,

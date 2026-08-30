@@ -190,6 +190,24 @@ pub struct Args {
 
     #[arg(long, default_value = "false")]
     pub websocket_tls_validate_certificate: bool,
+
+    #[arg(long, default_value = "local_data/runtime/iggy-shm.sock")]
+    pub shm_socket: String,
+
+    #[arg(long, default_value = "true")]
+    pub shm_reconnection_enabled: bool,
+
+    #[arg(long)]
+    pub shm_reconnection_max_retries: Option<u32>,
+
+    #[arg(long, default_value = "1s")]
+    pub shm_reconnection_interval: String,
+
+    #[arg(long, default_value = "5s")]
+    pub shm_reconnection_reestablish_after: String,
+
+    #[arg(long, default_value = "5s")]
+    pub shm_heartbeat_interval: String,
 }
 
 impl Args {
@@ -262,6 +280,12 @@ impl Default for Args {
             websocket_tls_domain: "localhost".to_string(),
             websocket_tls_ca_file: None,
             websocket_tls_validate_certificate: false,
+            shm_socket: "local_data/runtime/iggy-shm.sock".to_string(),
+            shm_reconnection_enabled: true,
+            shm_reconnection_max_retries: None,
+            shm_reconnection_interval: "1s".to_string(),
+            shm_reconnection_reestablish_after: "5s".to_string(),
+            shm_heartbeat_interval: "5s".to_string(),
         }
     }
 }
@@ -373,6 +397,12 @@ impl Args {
             websocket_tls_domain: self.websocket_tls_domain.clone(),
             websocket_tls_ca_file: self.websocket_tls_ca_file.clone(),
             websocket_tls_validate_certificate: self.websocket_tls_validate_certificate,
+            shm_socket: self.shm_socket.clone(),
+            shm_reconnection_enabled: self.shm_reconnection_enabled,
+            shm_reconnection_max_retries: self.shm_reconnection_max_retries,
+            shm_reconnection_interval: self.shm_reconnection_interval.clone(),
+            shm_reconnection_reestablish_after: self.shm_reconnection_reestablish_after.clone(),
+            shm_heartbeat_interval: self.shm_heartbeat_interval.clone(),
         }
     }
 

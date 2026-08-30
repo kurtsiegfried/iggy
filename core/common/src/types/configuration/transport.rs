@@ -32,6 +32,8 @@ pub enum TransportProtocol {
     Http = 3,
     #[strum(to_string = "ws")]
     WebSocket = 4,
+    #[strum(to_string = "shm")]
+    Shm = 5,
 }
 
 impl TransportProtocol {
@@ -49,6 +51,7 @@ impl TryFrom<u8> for TransportProtocol {
             v if v == TransportProtocol::Quic as u8 => Ok(TransportProtocol::Quic),
             v if v == TransportProtocol::Http as u8 => Ok(TransportProtocol::Http),
             v if v == TransportProtocol::WebSocket as u8 => Ok(TransportProtocol::WebSocket),
+            v if v == TransportProtocol::Shm as u8 => Ok(TransportProtocol::Shm),
             _ => Err(IggyError::InvalidCommand),
         }
     }
@@ -80,7 +83,7 @@ impl<'de> Deserialize<'de> for TransportProtocol {
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str(
-                    "a string (\"tcp\", \"quic\", \"http\", \"ws\") or a number (1, 2, 3, 4)",
+                    "a string (\"tcp\", \"quic\", \"http\", \"ws\", \"shm\") or a number (1, 2, 3, 4, 5)",
                 )
             }
 
@@ -104,6 +107,7 @@ impl<'de> Deserialize<'de> for TransportProtocol {
                     v if v == TransportProtocol::WebSocket as u8 => {
                         Ok(TransportProtocol::WebSocket)
                     }
+                    v if v == TransportProtocol::Shm as u8 => Ok(TransportProtocol::Shm),
                     _ => Err(serde::de::Error::custom(format!(
                         "invalid transport protocol number: {}",
                         value

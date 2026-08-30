@@ -25,6 +25,8 @@ mod leader_aware;
 pub mod prelude;
 pub mod quic;
 pub mod session;
+#[cfg(unix)]
+pub mod shm;
 pub mod stream_builder;
 pub mod tcp;
 mod vsr;

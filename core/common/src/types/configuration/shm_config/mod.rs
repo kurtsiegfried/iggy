@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod auth_config;
-pub(crate) mod http_config;
-pub(crate) mod quic_config;
-pub(crate) mod shm_config;
-pub(crate) mod tcp_config;
-pub(crate) mod transport;
-pub(crate) mod websocket_config;
+pub mod shm_client_config;
+pub mod shm_client_config_builder;
+pub mod shm_client_reconnection_config;
+pub mod shm_connection_string_options;
