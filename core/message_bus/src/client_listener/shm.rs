@@ -100,12 +100,27 @@ pub async fn run(listener: UnixListener, token: ShutdownToken, on_accepted: Acce
 fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
-        && !parent.exists()
     {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
+        if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        } else if let Err(error) =
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        {
+            // Narrowing the parent closes the window between bind
+            // creating the socket at umask permissions and the 0600
+            // restriction below, and covers server-created runtime
+            // dirs that default to wider modes. Best effort on a
+            // pre-existing parent: platform-managed directories
+            // (macOS per-user temp) refuse chmod even for the owner,
+            // and the 0600 socket remains the effective gate there.
+            debug!(
+                parent = %parent.display(),
+                "cannot narrow shm socket parent permissions: {error}"
+            );
+        }
     }
     // A previous run's socket file makes bind fail with EADDRINUSE
     // even though nothing is listening; remove it. A concurrently
