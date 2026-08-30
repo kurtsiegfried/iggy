@@ -201,8 +201,22 @@ pub struct MessageBusConfig {
     pub shm: ShmTuning,
 }
 
-/// Runtime shape of the `[shm]` section: plain integers, converted
-/// once at boot so the install path does no per-connection parsing.
+/// Fixed cadence of the shared-memory pump's housekeeping tick. Not
+/// operator-exposed; tests override through [`ShmTuning`].
+pub const DEFAULT_SHM_HEARTBEAT_TICK: Duration = Duration::from_secs(1);
+
+/// Fixed progress deadline for shared-memory clients.
+///
+/// A connection showing no frames and no heartbeat-word changes for
+/// this long is torn down, because an idle-forever client would
+/// otherwise pin its segment and admission slot with no in-band
+/// recovery. Not operator-exposed; tests override through
+/// [`ShmTuning`].
+pub const DEFAULT_SHM_CLIENT_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// Runtime shape of the `[shm]` section plus the fixed liveness
+/// constants, converted once at boot so the install path does no
+/// per-connection parsing.
 #[derive(Debug, Clone)]
 pub struct ShmTuning {
     /// Capacity of one log region; both directions use the same value.
@@ -211,6 +225,11 @@ pub struct ShmTuning {
     pub max_message_size: usize,
     /// Accept-side cap on concurrent shared-memory connections.
     pub max_connections: usize,
+    /// Pump housekeeping cadence; see [`DEFAULT_SHM_HEARTBEAT_TICK`].
+    pub heartbeat_tick: Duration,
+    /// Client progress deadline; see
+    /// [`DEFAULT_SHM_CLIENT_STALE_AFTER`].
+    pub client_stale_after: Duration,
 }
 
 impl Default for ShmTuning {
@@ -222,6 +241,8 @@ impl Default for ShmTuning {
             region_capacity: 8 * 1024 * 1024,
             max_message_size: 4_000_000,
             max_connections: 32,
+            heartbeat_tick: DEFAULT_SHM_HEARTBEAT_TICK,
+            client_stale_after: DEFAULT_SHM_CLIENT_STALE_AFTER,
         }
     }
 }
@@ -270,6 +291,8 @@ fn build_shm_tuning(shm: &configs::shm::ShmConfig) -> ShmTuning {
         region_capacity: byte_size_to_usize(shm.region_capacity),
         max_message_size: byte_size_to_usize(shm.max_message_size),
         max_connections: shm.max_connections as usize,
+        heartbeat_tick: DEFAULT_SHM_HEARTBEAT_TICK,
+        client_stale_after: DEFAULT_SHM_CLIENT_STALE_AFTER,
     }
 }
 

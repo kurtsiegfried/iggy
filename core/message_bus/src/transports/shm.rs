@@ -54,12 +54,25 @@
 //! order end to end, so replies leave in request order exactly like
 //! the TCP plane. There is no per-frame correlation on this
 //! transport; like WS, it relies on the caller's lockstep discipline.
+//!
+//! # Liveness contract
+//!
+//! A connected client must show progress within the tuned deadline:
+//! frames in either direction or a change of its control-page
+//! heartbeat word all count. A connection past the deadline with none
+//! of them is torn down even though its socket is open, because an
+//! idle-forever client would otherwise pin its segment and admission
+//! slot; genuinely idle clients keep the heartbeat word moving. The
+//! doorbell write is timeout-bounded (its trigger is client-writable
+//! memory), and doorbell wakes that keep producing no work are paced
+//! so a control-socket byte flood buys wall clock, not shard-0 CPU.
 
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::ptr::NonNull;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use compio::BufResult;
+use compio::buf::IoBuf;
 use compio::io::ancillary::AsyncWriteAncillary;
 use compio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use compio::net::UnixStream;
@@ -85,15 +98,22 @@ pub const WELCOME_UNSUPPORTED: u32 = 1;
 /// Segment allocation or mapping failed on the server.
 pub const WELCOME_INTERNAL: u32 = 2;
 
-/// Interval between heartbeat stores while parked, and the cadence of
-/// the wedged-peer staleness check.
-const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
-/// A client that once heartbeated and then went silent this long while
-/// its socket stays open is treated as wedged and torn down. Clients
-/// that never heartbeat are exempt; their liveness is socket EOF only.
-const CLIENT_STALE_AFTER: Duration = Duration::from_secs(30);
-
 const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
+
+/// Bound on a single doorbell write. The park-flag condition that
+/// triggers the write lives in client-writable memory, so a client
+/// that raises a flag and stops reading its socket could otherwise
+/// suspend the pump on this await forever once the send buffer fills.
+/// A stuck doorbell is a dead or hostile peer either way: teardown.
+const DOORBELL_WRITE_GRACE: Duration = Duration::from_secs(1);
+
+/// Consecutive doorbell wakes that produced no work before the pump
+/// starts pacing itself. A byte flood on the control socket otherwise
+/// converts directly into empty drain cycles on the shared shard-0
+/// executor; past this budget each further empty wake costs the
+/// flooder [`FLOOD_BACKOFF`] of wall clock instead.
+const EMPTY_WAKE_BUDGET: u32 = 8;
+const FLOOD_BACKOFF: Duration = Duration::from_millis(1);
 
 /// A single shared-memory connection, pre-handshake. `run` drives the
 /// handshake (bounded by the grace), then the pump.
@@ -149,7 +169,7 @@ impl TransportConn for ShmTransportConn {
             }
         };
 
-        run_pump(stream, session, self.tuning.max_message_size, ctx).await;
+        run_pump(stream, session, self.tuning, ctx).await;
     }
 }
 
@@ -274,13 +294,18 @@ async fn send_welcome(
 /// `SCM_RIGHTS` control message carrying one fd, laid out for the
 /// kernel by hand because compio takes the control buffer as raw
 /// bytes.
-fn scm_rights_control(fd: RawFd) -> Vec<u8> {
+fn scm_rights_control(fd: RawFd) -> AlignedControl {
     #[allow(clippy::cast_possible_truncation)]
     let space = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
-    let mut control = vec![0u8; space];
-    let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
-    // Safety: the buffer is CMSG_SPACE bytes, zeroed, exclusively ours;
-    // CMSG_DATA points inside it by construction.
+    let mut control = AlignedControl {
+        bytes: [0u8; ALIGNED_CONTROL_CAPACITY],
+        len: space,
+    };
+    assert!(space <= ALIGNED_CONTROL_CAPACITY);
+    let header = control.bytes.as_mut_ptr().cast::<libc::cmsghdr>();
+    // Safety: the buffer is 8-aligned by its repr, at least CMSG_SPACE
+    // bytes, zeroed, and exclusively ours; CMSG_DATA points inside it
+    // by construction.
     unsafe {
         (*header).cmsg_level = libc::SOL_SOCKET;
         #[allow(clippy::cast_possible_truncation)]
@@ -291,6 +316,28 @@ fn scm_rights_control(fd: RawFd) -> Vec<u8> {
         std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), fd);
     }
     control
+}
+
+/// Covers `CMSG_SPACE` for one fd on every unix target.
+const ALIGNED_CONTROL_CAPACITY: usize = 32;
+
+/// `SCM_RIGHTS` control buffer with the `cmsghdr` alignment the
+/// kernel and compio assume; a `Vec<u8>` promises only align 1 and
+/// would panic compio's alignment check under an allocator that
+/// honors it.
+#[repr(C, align(8))]
+struct AlignedControl {
+    bytes: [u8; ALIGNED_CONTROL_CAPACITY],
+    /// Exact `CMSG_SPACE`; the initialized view must not include the
+    /// tail padding, or the kernel would parse a zero-length second
+    /// cmsg and reject the send.
+    len: usize,
+}
+
+impl IoBuf for AlignedControl {
+    fn as_init(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
 }
 
 /// Per-iteration outcome of the parked select.
@@ -308,7 +355,7 @@ enum PumpWake {
 async fn run_pump(
     mut stream: UnixStream,
     mut session: ShmSession,
-    max_message_size: usize,
+    tuning: ShmTuning,
     ctx: ActorContext,
 ) {
     let ActorContext {
@@ -319,15 +366,41 @@ async fn run_pump(
         peer,
         ..
     } = ctx;
+    let max_message_size = tuning.max_message_size;
     let mut scratch: Vec<u8> = Vec::new();
     let mut pending_outbound: Option<crate::lifecycle::BusMessage> = None;
+    let mut doorbell_buffer: Option<Vec<u8>> = None;
+    let mut read_buffer: Option<Vec<u8>> = None;
+    // Client liveness is progress-based and monotonic: frames in
+    // either direction and heartbeat-word changes all count, and a
+    // connection past the deadline with none of them is torn down.
+    // This deliberately includes clients that never heartbeat; an
+    // idle-forever connection would otherwise pin its segment and
+    // admission slot with no in-band recovery.
+    let mut last_progress = Instant::now();
+    let mut last_client_heartbeat: u64 = 0;
+    let mut empty_doorbell_wakes: u32 = 0;
 
     loop {
+        let mut made_progress = false;
+
         // Inbound: drain committed client frames toward dispatch.
         loop {
             let payload_len = match session.consumer.try_poll() {
                 Ok(Some(record)) => {
                     let payload_len = record.payload_len();
+                    // Ceiling before any copy: the record length is
+                    // attacker-controlled up to a whole region, and a
+                    // large region would otherwise buy a huge
+                    // zero-fill + memcpy on the shared executor before
+                    // the decoder rejected it.
+                    if payload_len > max_message_size {
+                        warn!(
+                            %label, %peer, payload_len, max_message_size,
+                            "shm frame exceeds the frame ceiling; closing connection"
+                        );
+                        return;
+                    }
                     scratch.resize(payload_len, 0);
                     record.copy_payload_into(&mut scratch);
                     record.release();
@@ -345,6 +418,7 @@ async fn run_pump(
                         debug!(%label, %peer, "shm dispatch queue closed");
                         return;
                     }
+                    made_progress = true;
                 }
                 Err(decode_error) => {
                     warn!(%label, %peer, "shm frame rejected: {decode_error:?}");
@@ -372,7 +446,9 @@ async fn run_pump(
                 return;
             }
             match session.producer.try_append(frame.as_slice()) {
-                Ok(_position) => {}
+                Ok(_position) => {
+                    made_progress = true;
+                }
                 Err(AppendError::WouldBlock) => {
                     pending_outbound = Some(frame);
                     break;
@@ -384,12 +460,32 @@ async fn run_pump(
             }
         }
 
-        // Doorbell: one byte wakes the client whichever side it parked.
+        if made_progress {
+            last_progress = Instant::now();
+            empty_doorbell_wakes = 0;
+        }
+
+        // Doorbell: one byte wakes the client whichever side it
+        // parked. The write is bounded because its trigger condition
+        // is client-writable: a peer that raises a flag and stops
+        // reading must not suspend the pump on a full send buffer.
         if session.producer.consumer_parked() || session.consumer.producer_parked() {
-            let BufResult(write_result, _buffer) = stream.write(vec![1u8]).await;
-            if let Err(error) = write_result {
-                debug!(%label, %peer, "shm doorbell write failed: {error}");
-                return;
+            let buffer = doorbell_buffer.take().unwrap_or_else(|| vec![1u8]);
+            match compio::time::timeout(DOORBELL_WRITE_GRACE, stream.write(buffer)).await {
+                Ok(BufResult(Ok(_written), returned)) => {
+                    doorbell_buffer = Some(returned);
+                }
+                Ok(BufResult(Err(error), _buffer)) => {
+                    debug!(%label, %peer, "shm doorbell write failed: {error}");
+                    return;
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        %label, %peer,
+                        "shm doorbell write stuck; peer is not reading its socket"
+                    );
+                    return;
+                }
             }
         }
 
@@ -436,8 +532,12 @@ async fn run_pump(
                     Ok(frame) => PumpWake::Outbound(frame),
                     Err(_closed) => PumpWake::MailboxClosed,
                 },
-                read = stream.read(Vec::with_capacity(8)).fuse() => socket_wake(read),
-                () = compio::time::sleep(HEARTBEAT_TICK).fuse() => PumpWake::HeartbeatTick,
+                read = stream.read(take_read_buffer(&mut read_buffer)).fuse() => {
+                    let (wake, returned) = socket_wake(read);
+                    read_buffer = returned;
+                    wake
+                }
+                () = compio::time::sleep(tuning.heartbeat_tick).fuse() => PumpWake::HeartbeatTick,
             }
         } else {
             // The outbound log is full: taking more bus frames would
@@ -445,8 +545,12 @@ async fn run_pump(
             // until the client cleans a region.
             futures::select_biased! {
                 () = shutdown.wait().fuse() => PumpWake::Shutdown,
-                read = stream.read(Vec::with_capacity(8)).fuse() => socket_wake(read),
-                () = compio::time::sleep(HEARTBEAT_TICK).fuse() => PumpWake::HeartbeatTick,
+                read = stream.read(take_read_buffer(&mut read_buffer)).fuse() => {
+                    let (wake, returned) = socket_wake(read);
+                    read_buffer = returned;
+                    wake
+                }
+                () = compio::time::sleep(tuning.heartbeat_tick).fuse() => PumpWake::HeartbeatTick,
             }
         };
 
@@ -465,9 +569,27 @@ async fn run_pump(
                 debug!(%label, %peer, "shm outbound mailbox closed");
                 return;
             }
-            PumpWake::Doorbell | PumpWake::HeartbeatTick => {
-                if client_is_stale(&session.control) {
-                    warn!(%label, %peer, "shm client heartbeat stale; closing connection");
+            PumpWake::Doorbell => {
+                // A doorbell that keeps producing no work is a byte
+                // flood on the control socket; pace the pump so the
+                // flooder pays wall clock instead of shard-0 CPU. The
+                // counter resets on any real progress above.
+                empty_doorbell_wakes = empty_doorbell_wakes.saturating_add(1);
+                if empty_doorbell_wakes > EMPTY_WAKE_BUDGET {
+                    compio::time::sleep(FLOOD_BACKOFF).await;
+                }
+            }
+            PumpWake::HeartbeatTick => {
+                let client_heartbeat = session.control.load_heartbeat(Side::Client);
+                if client_heartbeat != last_client_heartbeat {
+                    last_client_heartbeat = client_heartbeat;
+                    last_progress = Instant::now();
+                }
+                if last_progress.elapsed() > tuning.client_stale_after {
+                    warn!(
+                        %label, %peer,
+                        "shm client showed no progress within the deadline; closing connection"
+                    );
                     return;
                 }
             }
@@ -483,26 +605,29 @@ async fn run_pump(
     }
 }
 
-fn socket_wake(read: BufResult<usize, Vec<u8>>) -> PumpWake {
-    let BufResult(read_result, _buffer) = read;
-    match read_result {
-        Ok(0) => PumpWake::PeerClosed,
-        Ok(_doorbell_bytes) => PumpWake::Doorbell,
-        Err(error) => PumpWake::SocketError(error),
-    }
+/// Reuse the parked-read buffer when the previous read completed; a
+/// cancelled read's buffer stays with the in-flight op until the
+/// kernel finishes, so a fresh allocation covers that case. On the
+/// flood path the read always completes, which is exactly when reuse
+/// matters. Sized to drain floods in fewer wakes than a 1-byte read
+/// would.
+fn take_read_buffer(slot: &mut Option<Vec<u8>>) -> Vec<u8> {
+    slot.take().map_or_else(
+        || Vec::with_capacity(4096),
+        |mut buffer| {
+            buffer.clear();
+            buffer
+        },
+    )
 }
 
-/// Wedge detection: a client that has stored at least one heartbeat
-/// and then stopped for [`CLIENT_STALE_AFTER`] is torn down even
-/// though its socket is still open. Clients that never heartbeat opt
-/// out and rely on socket EOF alone.
-fn client_is_stale(control: &ControlPage) -> bool {
-    let client_heartbeat = control.load_heartbeat(Side::Client);
-    if client_heartbeat == 0 {
-        return false;
+fn socket_wake(read: BufResult<usize, Vec<u8>>) -> (PumpWake, Option<Vec<u8>>) {
+    let BufResult(read_result, buffer) = read;
+    match read_result {
+        Ok(0) => (PumpWake::PeerClosed, Some(buffer)),
+        Ok(_doorbell_bytes) => (PumpWake::Doorbell, Some(buffer)),
+        Err(error) => (PumpWake::SocketError(error), Some(buffer)),
     }
-    let stale_micros = u64::try_from(CLIENT_STALE_AFTER.as_micros()).unwrap_or(u64::MAX);
-    now_micros().saturating_sub(client_heartbeat) > stale_micros
 }
 
 fn now_micros() -> u64 {

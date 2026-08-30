@@ -22,6 +22,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -47,14 +48,21 @@ const CLIENT_ID: u128 = 1;
 const WAIT_BUDGET: Duration = Duration::from_secs(10);
 
 fn test_bus() -> Rc<IggyMessageBus> {
+    test_bus_with(|_tuning| {})
+}
+
+fn test_bus_with(adjust: impl FnOnce(&mut ShmTuning)) -> Rc<IggyMessageBus> {
+    let mut tuning = ShmTuning {
+        region_capacity: REGION_CAPACITY,
+        max_message_size: MAX_MESSAGE_SIZE,
+        max_connections: 2,
+        ..ShmTuning::default()
+    };
+    adjust(&mut tuning);
     Rc::new(IggyMessageBus::with_tunables(
         0,
         MessageBusConfig {
-            shm: ShmTuning {
-                region_capacity: REGION_CAPACITY,
-                max_message_size: MAX_MESSAGE_SIZE,
-                max_connections: 2,
-            },
+            shm: tuning,
             ..MessageBusConfig::default()
         },
     ))
@@ -83,7 +91,7 @@ struct RawShmClient {
     stream: StdUnixStream,
     producer: LogProducer<shm::mem::RawLogMemory>,
     consumer: LogConsumer<shm::mem::RawLogMemory>,
-    _control: ControlPage,
+    control: ControlPage,
     mapping: SegmentMapping,
     _segment: AnonymousSegment,
 }
@@ -141,7 +149,7 @@ impl RawShmClient {
             stream,
             producer: LogProducer::new(producer_memory, geometry),
             consumer: LogConsumer::new(consumer_memory, geometry),
-            _control: control,
+            control,
             mapping,
             _segment: segment,
         }
@@ -154,6 +162,26 @@ impl RawShmClient {
         self.stream.write_all(&[1u8]).unwrap();
     }
 
+    /// Append with client-side backpressure: retry on a full log until
+    /// the server consumes, ringing each attempt.
+    fn send_frame_with_backpressure(&mut self, frame: &[u8]) {
+        let deadline = Instant::now() + WAIT_BUDGET;
+        loop {
+            match self.producer.try_append(frame) {
+                Ok(_position) => {
+                    self.stream.write_all(&[1u8]).unwrap();
+                    return;
+                }
+                Err(shm::producer::AppendError::WouldBlock) => {
+                    assert!(Instant::now() < deadline, "append never unblocked");
+                    self.stream.write_all(&[1u8]).unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("unexpected append error: {error}"),
+            }
+        }
+    }
+
     fn recv_frame(&mut self) -> Vec<u8> {
         let deadline = Instant::now() + WAIT_BUDGET;
         loop {
@@ -161,6 +189,11 @@ impl RawShmClient {
                 let mut frame = vec![0u8; record.payload_len()];
                 record.copy_payload_into(&mut frame);
                 record.release();
+                // The transport contract: ring the server when it
+                // parked its producer on our cleaning.
+                if self.consumer.producer_parked() {
+                    self.stream.write_all(&[1u8]).unwrap();
+                }
                 return frame;
             }
             assert!(Instant::now() < deadline, "timed out waiting for a frame");
@@ -368,6 +401,258 @@ async fn closing_the_socket_tears_the_connection_down() {
     join_client(client).await;
     wait_for_meta_gone(&bus).await;
     let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn handshake_rejects_a_bad_magic() {
+    let bus = test_bus();
+    let path = socket_path("badmagic");
+    install_echo_listener(&bus, &path);
+
+    let client = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let deadline = Instant::now() + WAIT_BUDGET;
+            let mut stream = loop {
+                match StdUnixStream::connect(&path) {
+                    Ok(stream) => break stream,
+                    Err(_not_yet) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("cannot connect: {error}"),
+                }
+            };
+            let mut hello = [0u8; HELLO_LEN];
+            hello[0..8].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+            hello[8..12].copy_from_slice(&LAYOUT_VERSION.to_le_bytes());
+            stream.write_all(&hello).unwrap();
+
+            let mut welcome = [0u8; WELCOME_LEN];
+            stream.read_exact(&mut welcome).unwrap();
+            let status = u32::from_le_bytes(welcome[12..16].try_into().unwrap());
+            assert_eq!(status, 1, "bad magic must be refused as unsupported");
+
+            // The server closes after a rejection; the next read is EOF.
+            let mut probe = [0u8; 1];
+            assert_eq!(stream.read(&mut probe).unwrap(), 0);
+        }
+    });
+
+    join_client(client).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn an_oversize_committed_record_tears_the_connection_down() {
+    let bus = test_bus();
+    let path = socket_path("oversize");
+    install_echo_listener(&bus, &path);
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let mut client = RawShmClient::connect(&path);
+            ready_tx.send(()).unwrap();
+            proceed_rx.recv().unwrap();
+            // A committed FRAME record spanning the whole region:
+            // structurally valid for the log, far above the frame
+            // ceiling. The server must tear down without paying a
+            // region-sized copy for it.
+            let memory = unsafe {
+                client.mapping.client_to_server_memory(
+                    &SegmentLayout::compute(
+                        LogGeometry {
+                            region_capacity: REGION_CAPACITY,
+                        },
+                        LogGeometry {
+                            region_capacity: REGION_CAPACITY,
+                        },
+                    )
+                    .unwrap(),
+                )
+            };
+            memory.write_data(4, &[1u8]);
+            #[allow(clippy::cast_possible_truncation)]
+            let whole_region = REGION_CAPACITY as u32;
+            memory
+                .record_length_word(0)
+                .store(whole_region, std::sync::atomic::Ordering::Release);
+            client.stream.write_all(&[1u8]).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    wait_for_signal(&ready_rx).await;
+    wait_for_meta_present(&bus).await;
+    proceed_tx.send(()).unwrap();
+    wait_for_meta_gone(&bus).await;
+    join_client(client).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn a_junk_byte_flood_does_not_kill_the_connection() {
+    let bus = test_bus();
+    let path = socket_path("flood");
+    install_echo_listener(&bus, &path);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let mut client = RawShmClient::connect(&path);
+            // 64 KiB of junk on the control socket: the pump must
+            // absorb it (paced, not spinning) and stay serviceable.
+            let junk = [0x5Au8; 4096];
+            for _ in 0..16 {
+                client.stream.write_all(&junk).unwrap();
+            }
+            let frame = request_frame(64, 0x42);
+            client.send_frame(&frame);
+            assert_eq!(client.recv_frame(), frame, "echo after flood");
+            done_tx.send(()).unwrap();
+            proceed_rx.recv().unwrap();
+        }
+    });
+
+    wait_for_signal(&done_rx).await;
+    assert!(
+        bus.client_meta(CLIENT_ID).is_some(),
+        "flood must not tear the connection down"
+    );
+    proceed_tx.send(()).unwrap();
+    join_client(client).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn an_idle_client_without_progress_is_reaped() {
+    let bus = test_bus_with(|tuning| {
+        tuning.heartbeat_tick = Duration::from_millis(50);
+        tuning.client_stale_after = Duration::from_millis(300);
+    });
+    let path = socket_path("reap");
+    install_echo_listener(&bus, &path);
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let client = RawShmClient::connect(&path);
+            ready_tx.send(()).unwrap();
+            // Idle with the socket held open, never heartbeating: the
+            // progress deadline must reap this connection.
+            proceed_rx.recv().unwrap();
+            drop(client);
+        }
+    });
+
+    wait_for_signal(&ready_rx).await;
+    wait_for_meta_present(&bus).await;
+    wait_for_meta_gone(&bus).await;
+    proceed_tx.send(()).unwrap();
+    join_client(client).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn heartbeat_changes_keep_an_idle_client_alive() {
+    // Wide margins: parallel test load can starve this runtime for
+    // hundreds of milliseconds, and a tight deadline would misread
+    // that starvation as client staleness.
+    let bus = test_bus_with(|tuning| {
+        tuning.heartbeat_tick = Duration::from_millis(50);
+        tuning.client_stale_after = Duration::from_secs(2);
+    });
+    let path = socket_path("heartbeat");
+    install_echo_listener(&bus, &path);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let client = RawShmClient::connect(&path);
+            // No frames, but a moving heartbeat word: well past the
+            // deadline the connection must still be alive.
+            for beat in 1..=10u64 {
+                client.control.store_heartbeat(Side::Client, beat);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            done_tx.send(()).unwrap();
+            // Hold the socket open until the liveness assertion has
+            // run; dropping here would race it with the EOF teardown.
+            proceed_rx.recv().unwrap();
+            drop(client);
+        }
+    });
+
+    wait_for_signal(&done_rx).await;
+    assert!(
+        bus.client_meta(CLIENT_ID).is_some(),
+        "a heartbeating idle client must not be reaped"
+    );
+    proceed_tx.send(()).unwrap();
+    join_client(client).await;
+    wait_for_meta_gone(&bus).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn outbound_backpressure_resumes_after_the_client_drains() {
+    let bus = test_bus();
+    let path = socket_path("backpressure");
+    install_echo_listener(&bus, &path);
+
+    let client = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            const ROUNDS: usize = 40;
+            let mut client = RawShmClient::connect(&path);
+            // Big echoes without consuming: the server-to-client log
+            // saturates, the pump stashes a pending frame and parks
+            // its producer on the reduced select branch.
+            let mut sent = Vec::with_capacity(ROUNDS);
+            for round in 0..ROUNDS {
+                #[allow(clippy::cast_possible_truncation)]
+                let frame = request_frame(8 * 1024, round as u8);
+                client.send_frame_with_backpressure(&frame);
+                sent.push(frame);
+            }
+            // Drain everything; recv_frame rings the doorbell whenever
+            // the server flagged its producer parked, resuming the
+            // stalled half of the pump.
+            for (round, expected) in sent.iter().enumerate() {
+                let echoed = client.recv_frame();
+                assert_eq!(&echoed, expected, "echo mismatch at round {round}");
+            }
+        }
+    });
+
+    join_client(client).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[compio::test]
+async fn socket_permissions_are_restricted() {
+    let parent = std::env::temp_dir().join(format!("iggy-shm-perm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    let path = parent.join("listener.sock");
+
+    let _listener = message_bus::client_listener::shm::bind(&path)
+        .await
+        .unwrap();
+
+    let socket_mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+    let parent_mode = std::fs::metadata(&parent).unwrap().mode() & 0o777;
+    assert_eq!(socket_mode, 0o600, "socket file must be owner-only");
+    assert_eq!(parent_mode, 0o700, "socket parent must be owner-only");
+
+    let _ = std::fs::remove_dir_all(&parent);
 }
 
 #[compio::test]

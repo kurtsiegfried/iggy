@@ -44,6 +44,7 @@ use shm::producer::LogProducer;
 use shm::segment::{AnonymousSegment, SegmentMapping};
 
 const SOCKET_PATH: &str = "/tmp/iggy-shm-vsr.sock";
+const CAP_SOCKET_PATH: &str = "/tmp/iggy-shm-cap.sock";
 const HELLO_LEN: usize = 16;
 const WELCOME_LEN: usize = 48;
 const EVICTION_REASON_INCOMPATIBLE_PROTOCOL: u8 = 14;
@@ -57,7 +58,7 @@ async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_sem
     tokio::task::spawn_blocking(|| {
         // Pre-auth ping, then a successful login-register, on one
         // connection: the pre-auth contract and the auth entry path.
-        let mut client = RawShmClient::connect();
+        let mut client = RawShmClient::connect(SOCKET_PATH);
 
         let ping = request_frame(ping_header(0xC0FFEE, HEADER_SIZE), &[]);
         client.send_frame(&ping);
@@ -78,7 +79,7 @@ async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_sem
         // A stale protocol version on a fresh connection: the version
         // gate answers with a typed eviction carrying the accepted
         // window, exactly like TCP.
-        let mut stale = RawShmClient::connect();
+        let mut stale = RawShmClient::connect(SOCKET_PATH);
         let stale_body = login_register_body(1);
         let stale_login = request_frame(
             register_header(0xBEEF, HEADER_SIZE + stale_body.len()),
@@ -102,6 +103,42 @@ async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_sem
                 .unwrap(),
         );
         assert!(window_min > 0, "eviction must carry the accepted window");
+    })
+    .await
+    .unwrap();
+}
+
+#[iggy_harness(server(
+    shm.enabled = "true",
+    shm.socket = "/tmp/iggy-shm-cap.sock",
+    shm.max_connections = "1"
+))]
+async fn given_full_admission_cap_when_second_client_connects_should_be_refused(
+    harness: &integration::harness::TestHarness,
+) {
+    let _server = harness.server();
+    tokio::task::spawn_blocking(|| {
+        // First connection fills the cap and stays alive.
+        let mut first = RawShmClient::connect(CAP_SOCKET_PATH);
+        let ping = request_frame(ping_header(0xC0FFEE, HEADER_SIZE), &[]);
+        first.send_frame(&ping);
+        assert_eq!(reply_status(&first.recv_frame()), 0);
+
+        // The second connection must be dropped before any WELCOME:
+        // the cap exists because each connection pins segment memory.
+        let mut refused = UnixStream::connect(CAP_SOCKET_PATH).unwrap();
+        let mut hello = [0u8; HELLO_LEN];
+        hello[0..8].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
+        hello[8..12].copy_from_slice(&LAYOUT_VERSION.to_le_bytes());
+        refused.write_all(&hello).unwrap();
+        refused.set_read_timeout(Some(WAIT_BUDGET)).unwrap();
+        let mut probe = [0u8; 1];
+        let read = std::io::Read::read(&mut refused, &mut probe).unwrap();
+        assert_eq!(read, 0, "past the cap the server must close pre-WELCOME");
+
+        // The admitted connection keeps working.
+        first.send_frame(&ping);
+        assert_eq!(reply_status(&first.recv_frame()), 0);
     })
     .await
     .unwrap();
@@ -169,10 +206,10 @@ struct RawShmClient {
 }
 
 impl RawShmClient {
-    fn connect() -> Self {
+    fn connect(socket_path: &str) -> Self {
         let deadline = Instant::now() + WAIT_BUDGET;
         let mut stream = loop {
-            match UnixStream::connect(SOCKET_PATH) {
+            match UnixStream::connect(socket_path) {
                 Ok(stream) => break stream,
                 Err(_not_yet) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
