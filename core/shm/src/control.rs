@@ -20,15 +20,18 @@
 //!
 //! Initialization publishes the magic word last, with release
 //! ordering, so a peer that observes the magic is guaranteed to see
-//! the version and geometry it gates. The heartbeat words catch a peer
-//! that is alive but wedged, which the socket's EOF cannot report.
+//! the version and geometry it gates. The pid, start, and heartbeat
+//! words are raw material for the transport layer: storing and
+//! loading them is this crate's job, while the staleness policy that
+//! turns them into wedged-peer detection (and the teardown decision)
+//! belongs to the caller.
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use crate::layout::{LAYOUT_VERSION, LogGeometry, SEGMENT_MAGIC, SegmentLayout};
+use crate::layout::{LAYOUT_VERSION, LayoutError, LogGeometry, SEGMENT_MAGIC, SegmentLayout};
 
 pub const MAGIC_OFFSET: usize = 0;
 pub const LAYOUT_VERSION_OFFSET: usize = 8;
@@ -54,6 +57,8 @@ pub enum ControlError {
     BadMagic { found: u64 },
     #[error("layout version {found} is not supported (this build speaks {LAYOUT_VERSION})")]
     UnsupportedLayoutVersion { found: u32 },
+    #[error("control page advertises an invalid geometry: {source}")]
+    InvalidGeometry { source: LayoutError },
 }
 
 /// View over the control page of a mapped segment.
@@ -96,13 +101,16 @@ impl ControlPage {
     }
 
     /// Client-side validation; returns the geometries the server
-    /// published.
+    /// published. The page is peer-written, so the geometries are
+    /// re-validated here rather than trusted; a value that survives
+    /// this call is safe to hand to the log constructors.
     ///
     /// # Errors
     ///
     /// [`ControlError::BadMagic`] when the magic word is absent or
     /// wrong, [`ControlError::UnsupportedLayoutVersion`] on a version
-    /// this build does not speak.
+    /// this build does not speak, [`ControlError::InvalidGeometry`]
+    /// when an advertised capacity fails [`LogGeometry::validate`].
     pub fn validate(&self) -> Result<(LogGeometry, LogGeometry), ControlError> {
         let found = self.word(MAGIC_OFFSET).load(Ordering::Acquire);
         if found != SEGMENT_MAGIC {
@@ -112,19 +120,24 @@ impl ControlPage {
         if version != LAYOUT_VERSION {
             return Err(ControlError::UnsupportedLayoutVersion { found: version });
         }
-        #[allow(clippy::cast_possible_truncation)]
-        let client_to_server = LogGeometry {
-            region_capacity: self
-                .word(CLIENT_TO_SERVER_REGION_CAPACITY_OFFSET)
-                .load(Ordering::Relaxed) as usize,
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let server_to_client = LogGeometry {
-            region_capacity: self
-                .word(SERVER_TO_CLIENT_REGION_CAPACITY_OFFSET)
-                .load(Ordering::Relaxed) as usize,
-        };
+        let client_to_server = self.advertised_geometry(CLIENT_TO_SERVER_REGION_CAPACITY_OFFSET)?;
+        let server_to_client = self.advertised_geometry(SERVER_TO_CLIENT_REGION_CAPACITY_OFFSET)?;
         Ok((client_to_server, server_to_client))
+    }
+
+    fn advertised_geometry(&self, offset: usize) -> Result<LogGeometry, ControlError> {
+        let advertised = self.word(offset).load(Ordering::Relaxed);
+        let region_capacity =
+            usize::try_from(advertised).map_err(|_| ControlError::InvalidGeometry {
+                source: LayoutError::RegionCapacityTooLarge {
+                    region_capacity: usize::MAX,
+                },
+            })?;
+        let geometry = LogGeometry { region_capacity };
+        geometry
+            .validate()
+            .map_err(|source| ControlError::InvalidGeometry { source })?;
+        Ok(geometry)
     }
 
     /// Records this side's identity once, right after it maps the

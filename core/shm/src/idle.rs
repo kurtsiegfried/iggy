@@ -54,7 +54,7 @@ impl IdleState {
         self.idle_rounds = self.idle_rounds.saturating_add(1);
         if round < strategy.spin_limit {
             IdleAdvice::Spin
-        } else if round < strategy.spin_limit + strategy.yield_limit {
+        } else if round < strategy.spin_limit.saturating_add(strategy.yield_limit) {
             IdleAdvice::Yield
         } else {
             IdleAdvice::Park

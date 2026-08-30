@@ -30,15 +30,18 @@ use thiserror::Error;
 
 use crate::layout::{
     CLEANED_CYCLES_OFFSET, CONSUMER_PARKED_OFFSET, HEAD_OFFSET, LogGeometry,
-    PRODUCER_PARKED_OFFSET, RECORD_HEADER_SIZE, REGION_COUNT,
+    PRODUCER_PARKED_OFFSET, RECORD_HEADER_SIZE, REGION_COUNT, assert_sound_geometry,
 };
 use crate::mem::LogMemory;
 use crate::record::{RECORD_TYPE_FRAME, RECORD_TYPE_OFFSET, RECORD_TYPE_PADDING};
 use crate::sync::{Ordering, fence};
 
-/// Structural violations in the shared log. All of them mean the
-/// producer is broken or hostile; the log must not be read further.
-#[derive(Debug, Error, PartialEq, Eq)]
+/// Structural violations in the shared log; all of them mean the
+/// producer is broken or hostile.
+///
+/// The error is sticky: every later poll returns it again, so the log
+/// cannot flip between error and progress under an adversarial writer.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum PollError {
     #[error("commit word {committed} is below the record header size")]
     CommitBelowHeader { committed: u32 },
@@ -48,6 +51,13 @@ pub enum PollError {
     UnknownRecordType { record_type: u8 },
     #[error("padding record of {committed} bytes does not close the region ({remaining} left)")]
     MisplacedPadding { committed: u32, remaining: usize },
+    /// An honest producer never pads at a region start: the largest
+    /// legal record is half a region, so it always fits there. This
+    /// rule also bounds one poll call to at most one padding skip,
+    /// which is what stops a hostile writer from spinning the
+    /// consumer inside a single call with a padding-only stream.
+    #[error("padding record at a region start")]
+    PaddingAtRegionStart,
 }
 
 #[derive(Debug)]
@@ -56,6 +66,7 @@ pub struct LogConsumer<M: LogMemory> {
     region_capacity: usize,
     head: u64,
     cleaned_cycles: u64,
+    poison: Option<PollError>,
 }
 
 /// One committed frame, borrowed from the log until released.
@@ -73,25 +84,39 @@ pub struct RecordView<'a, M: LogMemory> {
 impl<M: LogMemory> LogConsumer<M> {
     /// The memory must satisfy the [`LogMemory`] contract for
     /// `geometry` and be the same log the producer was created over.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a geometry no log can be sound over; same rules as
+    /// [`crate::producer::LogProducer::new`].
     pub fn new(memory: M, geometry: LogGeometry) -> Self {
-        debug_assert!(geometry.region_capacity.is_power_of_two());
+        assert_sound_geometry(geometry);
         debug_assert_eq!(memory.data_len(), geometry.data_len());
         Self {
             memory,
             region_capacity: geometry.region_capacity,
             head: 0,
             cleaned_cycles: 0,
+            poison: None,
         }
     }
 
     /// Returns the next committed frame, or `None` when the log is
     /// drained up to the producer's commits.
     ///
+    /// Bounded per call: at most one padding skip can precede the
+    /// returned frame, because padding is only legal past a region
+    /// start and skipping it lands exactly on one.
+    ///
     /// # Errors
     ///
-    /// Returns [`PollError`] on a structurally invalid record; the log
-    /// is unusable afterwards and the connection must be torn down.
+    /// Returns [`PollError`] on a structurally invalid record. The
+    /// error is sticky: every subsequent call returns it again, so the
+    /// caller can only tear the connection down.
     pub fn try_poll(&mut self) -> Result<Option<RecordView<'_, M>>, PollError> {
+        if let Some(poison) = self.poison {
+            return Err(poison);
+        }
         loop {
             let offset = self.head_offset();
             let data_offset = self.active_region() * self.region_capacity + offset;
@@ -105,13 +130,13 @@ impl<M: LogMemory> LogConsumer<M> {
 
             let remaining = self.region_capacity - offset;
             if (committed as usize) < RECORD_HEADER_SIZE {
-                return Err(PollError::CommitBelowHeader { committed });
+                return Err(self.poison(PollError::CommitBelowHeader { committed }));
             }
             if committed as usize > remaining {
-                return Err(PollError::CommitOverrunsRegion {
+                return Err(self.poison(PollError::CommitOverrunsRegion {
                     committed,
                     remaining,
-                });
+                }));
             }
 
             let mut record_type = [0u8; 1];
@@ -128,17 +153,27 @@ impl<M: LogMemory> LogConsumer<M> {
                     }));
                 }
                 RECORD_TYPE_PADDING => {
+                    if offset == 0 {
+                        return Err(self.poison(PollError::PaddingAtRegionStart));
+                    }
                     if committed as usize != remaining {
-                        return Err(PollError::MisplacedPadding {
+                        return Err(self.poison(PollError::MisplacedPadding {
                             committed,
                             remaining,
-                        });
+                        }));
                     }
                     self.advance(remaining);
                 }
-                record_type => return Err(PollError::UnknownRecordType { record_type }),
+                record_type => {
+                    return Err(self.poison(PollError::UnknownRecordType { record_type }));
+                }
             }
         }
+    }
+
+    const fn poison(&mut self, error: PollError) -> PollError {
+        self.poison = Some(error);
+        error
     }
 
     /// Declares this consumer parked before sleeping. The caller must

@@ -106,6 +106,41 @@ impl LogGeometry {
         let region_count = REGION_COUNT as usize;
         self.region_capacity * region_count
     }
+
+    /// [`LogGeometry::data_len`] without the assumption that it fits;
+    /// `None` means the address space cannot hold this log at all
+    /// (reachable on 32-bit targets with capacities `validate`
+    /// otherwise accepts).
+    #[must_use]
+    pub const fn checked_data_len(&self) -> Option<usize> {
+        #[allow(clippy::cast_possible_truncation)]
+        // REGION_COUNT is 3; it is u64 only for stream-position math.
+        let region_count = REGION_COUNT as usize;
+        self.region_capacity.checked_mul(region_count)
+    }
+}
+
+/// Constructor guard shared by the producer and consumer: the subset
+/// of validity a log cannot be sound without. Looser than
+/// [`LogGeometry::validate`] (no production minimum), so tests can
+/// exercise boundaries with tiny regions.
+pub(crate) fn assert_sound_geometry(geometry: LogGeometry) {
+    assert!(
+        geometry.region_capacity.is_power_of_two(),
+        "region capacity must be a power of two",
+    );
+    assert!(
+        geometry.region_capacity >= 2 * RECORD_HEADER_SIZE,
+        "region capacity cannot hold a record",
+    );
+    assert!(
+        geometry.region_capacity <= MAX_REGION_CAPACITY,
+        "region capacity above the maximum would let a commit word truncate to zero",
+    );
+    assert!(
+        geometry.checked_data_len().is_some(),
+        "log does not fit this platform's address space",
+    );
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -116,6 +151,8 @@ pub enum LayoutError {
     RegionCapacityTooSmall { region_capacity: usize },
     #[error("region capacity {region_capacity} is above the maximum {MAX_REGION_CAPACITY}")]
     RegionCapacityTooLarge { region_capacity: usize },
+    #[error("segment layout does not fit this platform's address space")]
+    SegmentTooLarge,
 }
 
 /// Byte placement of every section inside the shared segment.
@@ -138,7 +175,11 @@ pub struct SegmentLayout {
 impl SegmentLayout {
     /// # Errors
     ///
-    /// Returns a [`LayoutError`] when either log's geometry is invalid.
+    /// Returns a [`LayoutError`] when either log's geometry is
+    /// invalid, or when the combined segment does not fit the
+    /// platform's address space (the checked arithmetic here is the
+    /// guard 32-bit targets rely on; per-region validation alone
+    /// cannot bound the sum).
     pub fn compute(
         client_to_server: LogGeometry,
         server_to_client: LogGeometry,
@@ -148,13 +189,26 @@ impl SegmentLayout {
 
         let control_offset = 0;
         let client_to_server_counters_offset = control_offset + SEGMENT_PAGE_SIZE;
-        let server_to_client_counters_offset =
-            client_to_server_counters_offset + page_rounded(COUNTERS_BLOCK_SIZE);
-        let client_to_server_data_offset =
-            server_to_client_counters_offset + page_rounded(COUNTERS_BLOCK_SIZE);
-        let server_to_client_data_offset =
-            client_to_server_data_offset + client_to_server.data_len();
-        let total_len = server_to_client_data_offset + server_to_client.data_len();
+        let server_to_client_counters_offset = client_to_server_counters_offset
+            .checked_add(page_rounded(COUNTERS_BLOCK_SIZE))
+            .ok_or(LayoutError::SegmentTooLarge)?;
+        let client_to_server_data_offset = server_to_client_counters_offset
+            .checked_add(page_rounded(COUNTERS_BLOCK_SIZE))
+            .ok_or(LayoutError::SegmentTooLarge)?;
+        let server_to_client_data_offset = client_to_server_data_offset
+            .checked_add(
+                client_to_server
+                    .checked_data_len()
+                    .ok_or(LayoutError::SegmentTooLarge)?,
+            )
+            .ok_or(LayoutError::SegmentTooLarge)?;
+        let total_len = server_to_client_data_offset
+            .checked_add(
+                server_to_client
+                    .checked_data_len()
+                    .ok_or(LayoutError::SegmentTooLarge)?,
+            )
+            .ok_or(LayoutError::SegmentTooLarge)?;
 
         Ok(Self {
             client_to_server,

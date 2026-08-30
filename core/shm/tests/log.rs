@@ -29,7 +29,7 @@ use shm::consumer::{LogConsumer, PollError};
 use shm::layout::{COUNTERS_BLOCK_SIZE, LogGeometry, RECORD_HEADER_SIZE};
 use shm::mem::{LogMemory, RawLogMemory};
 use shm::producer::{AppendError, LogProducer};
-use shm::record::RECORD_TYPE_OFFSET;
+use shm::record::{RECORD_TYPE_FRAME, RECORD_TYPE_OFFSET, RECORD_TYPE_PADDING};
 
 struct HeapLog {
     counters: NonNull<u8>,
@@ -114,7 +114,7 @@ fn sustained_wraparound_preserves_every_payload() {
     let mut producer = LogProducer::new(log.memory(), geometry);
     let mut consumer = LogConsumer::new(log.memory(), geometry);
 
-    let total_records: u64 = 10_000;
+    let total_records: u64 = if cfg!(miri) { 300 } else { 10_000 };
     let mut sizes = SplitMix64 { state: 7 };
     let mut appended: u64 = 0;
     let mut records_consumed: u64 = 0;
@@ -231,6 +231,140 @@ fn undersized_commit_word_poisons_the_log() {
             committed: below_header,
         }
     );
+}
+
+#[test]
+fn padding_at_region_start_poisons_the_log() {
+    let log = HeapLog::new(1024);
+    let mut consumer = LogConsumer::new(log.memory(), log.geometry);
+
+    // A whole-region padding record at a region base is the hostile
+    // shape that would otherwise spin the consumer forever.
+    log.memory()
+        .write_data(RECORD_TYPE_OFFSET, &[RECORD_TYPE_PADDING]);
+    #[allow(clippy::cast_possible_truncation)]
+    let whole_region = log.geometry.region_capacity as u32;
+    log.memory()
+        .record_length_word(0)
+        .store(whole_region, Ordering::Release);
+
+    assert_eq!(
+        consumer.try_poll().unwrap_err(),
+        PollError::PaddingAtRegionStart
+    );
+}
+
+#[test]
+fn misplaced_padding_poisons_the_log() {
+    let log = HeapLog::new(1024);
+    let mut producer = LogProducer::new(log.memory(), log.geometry);
+    let mut consumer = LogConsumer::new(log.memory(), log.geometry);
+
+    producer.try_append(&[5u8; 16]).unwrap();
+    consumer.try_poll().unwrap().unwrap().release();
+
+    // Hostile padding past the region start whose length does not
+    // close the region.
+    log.memory()
+        .write_data(32 + RECORD_TYPE_OFFSET, &[RECORD_TYPE_PADDING]);
+    #[allow(clippy::cast_possible_truncation)]
+    let short_padding = (log.geometry.region_capacity - 48) as u32;
+    log.memory()
+        .record_length_word(32)
+        .store(short_padding, Ordering::Release);
+
+    assert_eq!(
+        consumer.try_poll().unwrap_err(),
+        PollError::MisplacedPadding {
+            committed: short_padding,
+            remaining: log.geometry.region_capacity - 32,
+        }
+    );
+}
+
+#[test]
+fn poll_errors_are_sticky() {
+    let log = HeapLog::new(1024);
+    let mut producer = LogProducer::new(log.memory(), log.geometry);
+    let mut consumer = LogConsumer::new(log.memory(), log.geometry);
+    producer.try_append(&[1, 2, 3]).unwrap();
+
+    log.memory().write_data(RECORD_TYPE_OFFSET, &[0x77]);
+    let first = consumer.try_poll().unwrap_err();
+    assert_eq!(first, PollError::UnknownRecordType { record_type: 0x77 });
+
+    // A hostile producer repairing the record afterwards must not
+    // flip the log back to making progress.
+    log.memory()
+        .write_data(RECORD_TYPE_OFFSET, &[RECORD_TYPE_FRAME]);
+    assert_eq!(consumer.try_poll().unwrap_err(), first);
+}
+
+#[test]
+fn max_payload_and_exact_region_fill_round_trip() {
+    let log = HeapLog::new(1024);
+    let mut producer = LogProducer::new(log.memory(), log.geometry);
+    let mut consumer = LogConsumer::new(log.memory(), log.geometry);
+
+    // Two maximum-size records tile a region exactly, so the third
+    // append rotates with no padding record in between.
+    let max_payload = vec![0xC3u8; log.geometry.max_payload_len()];
+    let first = producer.try_append(&max_payload).unwrap();
+    let second = producer.try_append(&max_payload).unwrap();
+    let third = producer.try_append(&[9u8; 4]).unwrap();
+    assert_eq!(first, 0);
+    assert_eq!(second, 512);
+    assert_eq!(third, 1024);
+
+    for expected_len in [max_payload.len(), max_payload.len(), 4] {
+        let record = consumer.try_poll().unwrap().unwrap();
+        assert_eq!(record.payload_len(), expected_len);
+        record.release();
+    }
+    assert!(consumer.try_poll().unwrap().is_none());
+}
+
+/// Two real threads over the production raw-pointer accessor. Under
+/// Miri this is the one schedule where its data-race detector can see
+/// the plain data copies and the atomics interact; under plain cargo
+/// test it doubles as a cross-thread smoke test.
+#[test]
+fn two_threads_round_trip_over_raw_memory() {
+    let log = HeapLog::new(256);
+    let geometry = log.geometry;
+    let producer_memory = log.memory();
+    let consumer_memory = log.memory();
+    let total_records: u64 = if cfg!(miri) { 64 } else { 4096 };
+
+    let producer_thread = std::thread::spawn(move || {
+        let mut producer = LogProducer::new(producer_memory, geometry);
+        for record_index in 0..total_records {
+            let payload = payload_for(record_index, usize::try_from(record_index % 64).unwrap());
+            loop {
+                match producer.try_append(&payload) {
+                    Ok(_) => break,
+                    Err(AppendError::WouldBlock) => std::thread::yield_now(),
+                    Err(error) => panic!("unexpected append error: {error}"),
+                }
+            }
+        }
+    });
+
+    let mut consumer = LogConsumer::new(consumer_memory, geometry);
+    let mut records_consumed: u64 = 0;
+    while records_consumed < total_records {
+        match consumer.try_poll().unwrap() {
+            Some(record) => {
+                let mut payload = vec![0u8; record.payload_len()];
+                record.copy_payload_into(&mut payload);
+                assert_eq!(payload, payload_for(records_consumed, payload.len()));
+                record.release();
+                records_consumed += 1;
+            }
+            None => std::thread::yield_now(),
+        }
+    }
+    producer_thread.join().unwrap();
 }
 
 #[test]

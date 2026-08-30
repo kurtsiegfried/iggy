@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use loom::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use loom::sync::{Condvar, Mutex};
 
 use shm::consumer::LogConsumer;
 use shm::layout::{COUNTERS_BLOCK_SIZE, LogGeometry};
@@ -126,9 +127,11 @@ fn payload_for(record_index: usize, payload_len: usize) -> Vec<u8> {
     vec![fill; payload_len]
 }
 
-fn run_pair(payload_lens: &'static [usize], preemption_bound: usize) {
+fn run_pair(payload_lens: &'static [usize], preemption_bound: Option<usize>) {
+    // None explores the full DPOR-reduced schedule space; a bound is
+    // a measured cost/coverage tradeoff, stated at the call site.
     let mut model = loom::model::Builder::new();
-    model.preemption_bound = Some(preemption_bound);
+    model.preemption_bound = preemption_bound;
     model.check(move || {
         let memory = LoomLogMemory::new(geometry());
         let mut producer = LogProducer::new(memory.clone(), geometry());
@@ -174,15 +177,22 @@ fn run_pair(payload_lens: &'static [usize], preemption_bound: usize) {
 /// exact bytes the producer wrote, under every interleaving.
 #[test]
 fn loom_commit_visibility() {
-    run_pair(&[16, 16], 3);
+    run_pair(&[16, 16], None);
 }
 
-/// Rotation against cleaning: six records at two per region force two
-/// full rotations through cleaned-region admission, concurrently with
-/// the consumer's zeroing.
+/// Rotation against cleaning, through the admission edge: eight
+/// records at two per region push the producer into cycle 3, whose
+/// entry is the first to require the consumer's cleaned-cycles
+/// publication (cycles 0..3 are admitted unconditionally). The
+/// producer observes WouldBlock and retries while the consumer is
+/// zeroing concurrently, so the release/acquire edge that orders
+/// zero_data before region reuse is exercised, not just declared.
 #[test]
 fn loom_rotation_clean_handoff() {
-    run_pair(&[16, 16, 16, 16, 16, 16], 2);
+    // Bound 4: unbounded takes ~2 minutes at this depth, and four
+    // preemptions is calibrated against the known kill: the admission
+    // off-by-one mutation fails this test at this bound.
+    run_pair(&[16, 16, 16, 16, 16, 16, 16, 16], Some(4));
 }
 
 /// Padding boundary: the 32 + 16 byte claims leave a 16-byte remainder
@@ -190,7 +200,93 @@ fn loom_rotation_clean_handoff() {
 /// while the consumer is skipping concurrently.
 #[test]
 fn loom_padding_boundary() {
-    run_pair(&[16, 0, 16, 16], 2);
+    run_pair(&[16, 0, 16, 16], None);
+}
+
+/// The backpressure mirror of the lost-wake test, with the doorbell
+/// modeled faithfully: once the producer's post-park recheck fails it
+/// sleeps on a doorbell that only the consumer rings, and the
+/// consumer rings only when a post-release check observes the parked
+/// flag, exactly like the transport. A lost wake is then an
+/// every-thread-yields livelock, which loom reports; termination
+/// under every interleaving is the liveness proof for the park
+/// protocol's producer direction.
+#[test]
+fn loom_producer_park_never_loses_a_wake() {
+    // Bound 3: the lost-wake class needs two preemptions (store
+    // buffering), and unbounded exploration of this seven-record
+    // model exceeds loom's branch budget. Calibrated against the
+    // known kill: removing the fence from the consumer's parked-flag
+    // check deadlocks this test at this bound.
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+        let memory = LoomLogMemory::new(geometry());
+        let mut producer = LogProducer::new(memory.clone(), geometry());
+        let mut consumer = LogConsumer::new(memory, geometry());
+
+        let doorbell = Arc::new((Mutex::new(false), Condvar::new()));
+        let doorbell_for_producer = Arc::clone(&doorbell);
+
+        const RECORD_COUNT: usize = 7;
+
+        let producer_thread = loom::thread::spawn(move || {
+            for record_index in 0..RECORD_COUNT {
+                let payload = payload_for(record_index, 16);
+                let mut parked = false;
+                loop {
+                    match producer.try_append(&payload) {
+                        Ok(_) => {
+                            if parked {
+                                producer.cancel_park();
+                            }
+                            break;
+                        }
+                        Err(AppendError::WouldBlock) => {
+                            if !parked {
+                                // First refusal: declare the park, then
+                                // the next loop iteration is the fenced
+                                // recheck.
+                                producer.prepare_park();
+                                parked = true;
+                                continue;
+                            }
+                            // Recheck failed: block until the consumer
+                            // rings, as the transport would on its
+                            // socket. A lost wake leaves this thread
+                            // waiting forever, which loom reports as a
+                            // deadlock.
+                            let (rung, bell) = &*doorbell_for_producer;
+                            let mut rung_guard = rung.lock().unwrap();
+                            while !*rung_guard {
+                                rung_guard = bell.wait(rung_guard).unwrap();
+                            }
+                            *rung_guard = false;
+                        }
+                        Err(error) => panic!("unexpected append error: {error}"),
+                    }
+                }
+            }
+        });
+
+        let mut records_consumed = 0;
+        while records_consumed < RECORD_COUNT {
+            match consumer.try_poll().unwrap() {
+                Some(record) => {
+                    record.release();
+                    records_consumed += 1;
+                    if consumer.producer_parked() {
+                        let (rung, bell) = &*doorbell;
+                        *rung.lock().unwrap() = true;
+                        bell.notify_one();
+                    }
+                }
+                None => loom::thread::yield_now(),
+            }
+        }
+
+        producer_thread.join().unwrap();
+    });
 }
 
 /// The park handshake cannot lose a wake: if the consumer decides to
