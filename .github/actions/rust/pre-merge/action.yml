@@ -403,7 +403,8 @@ runs:
       run: |
         cargo +nightly-2026-04-21 miri test --locked \
           -p iggy_binary_protocol \
-          -p consensus
+          -p consensus \
+          -p shm
       shell: bash
 
     # aarch64 builds (run on ARM64 runners)

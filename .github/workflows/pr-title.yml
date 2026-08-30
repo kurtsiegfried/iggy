@@ -95,3 +95,4 @@ jobs:
             simulator
             configs
             gateways
+            shm
