@@ -900,6 +900,35 @@ self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 
+# Shared-memory transport for clients on the same host. A unix socket
+# carries the handshake, the shared-segment fd, doorbell wakes, and
+# liveness (peer close tears the connection down); the data path is a
+# pair of shared-memory logs, one per direction.
+[shm]
+enabled = false
+
+# Unix socket path clients connect to. Must stay under the platform's
+# sun_path limit (about 100 usable bytes), which rules out deeply
+# nested runtime directories.
+socket = "local_data/runtime/iggy-shm.sock"
+
+# Capacity of one log region. Each direction of a connection maps
+# three regions, so one connection pins about six times this value in
+# memory. Must be a power of two within 64 KiB..=1 GiB.
+region_capacity = "8 MiB"
+
+# Largest wire frame accepted over shared memory. A frame must fit in
+# half a region minus the 16-byte record header, which is why this
+# default is decimal MB: exactly half a binary region misses that
+# bound by the header. Unlike the TCP plane's 64 MiB ceiling, the
+# shared-memory default trades frame size for per-connection memory.
+max_message_size = "4 MB"
+
+# Cap on concurrent shared-memory connections, enforced at accept.
+# Each connection pins real memory (see region_capacity), so unlike
+# TCP the accept loop refuses connections past the cap.
+max_connections = 32
+
 # Metadata consensus plane tunables (shard 0's VSR replica: users,
 # streams, topics, sessions). Size these together: a deeper prepare queue
 # admits more concurrent in-flight metadata ops (e.g. login storms), and

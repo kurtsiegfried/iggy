@@ -30,6 +30,7 @@ mod login_credentials_vsr;
 // Poll addressing + timestamp semantics: typed PartitionNotFound on a bad
 // partition id, at-or-after timestamp polls.
 mod poll_semantics_vsr;
+mod shm_vsr;
 // Create-topic static bounds deny typed before consensus.
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.

@@ -27,5 +27,5 @@ pub use configs_impl::{
     FileConfigProvider, RelocatedKey, TypedEnvProvider, parse_env_value_to_json,
 };
 pub use server_config::{
-    cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,
+    cluster, message_bus, metadata, partition, quic, server, sharding, shm, tcp, websocket,
 };
