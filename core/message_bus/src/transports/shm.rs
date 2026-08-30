@@ -89,14 +89,9 @@ use super::ws::decode_consensus_frame;
 use super::{ActorContext, TransportConn};
 use crate::config::ShmTuning;
 
-pub const HELLO_LEN: usize = 16;
-pub const WELCOME_LEN: usize = 48;
-
-pub const WELCOME_OK: u32 = 0;
-/// The client's magic or layout version is not one this build speaks.
-pub const WELCOME_UNSUPPORTED: u32 = 1;
-/// Segment allocation or mapping failed on the server.
-pub const WELCOME_INTERNAL: u32 = 2;
+pub use shm::handshake::{
+    HELLO_LEN, WELCOME_INTERNAL, WELCOME_LEN, WELCOME_OK, WELCOME_UNSUPPORTED,
+};
 
 const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 
@@ -265,14 +260,14 @@ async fn send_welcome(
     client_id: u128,
     segment_fd: Option<RawFd>,
 ) -> std::io::Result<()> {
-    let mut welcome = Vec::with_capacity(WELCOME_LEN);
-    welcome.extend_from_slice(&SEGMENT_MAGIC.to_le_bytes());
-    welcome.extend_from_slice(&LAYOUT_VERSION.to_le_bytes());
-    welcome.extend_from_slice(&status.to_le_bytes());
-    welcome.extend_from_slice(&(tuning.region_capacity as u64).to_le_bytes());
-    welcome.extend_from_slice(&(tuning.max_message_size as u64).to_le_bytes());
-    welcome.extend_from_slice(&client_id.to_le_bytes());
-    debug_assert_eq!(welcome.len(), WELCOME_LEN);
+    let welcome = shm::handshake::Welcome {
+        status,
+        region_capacity: tuning.region_capacity as u64,
+        max_message_size: tuning.max_message_size as u64,
+        client_id,
+    }
+    .encode()
+    .to_vec();
 
     let written = if let Some(fd) = segment_fd {
         let control_bytes = scm_rights_control(fd);

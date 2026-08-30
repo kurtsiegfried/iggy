@@ -58,6 +58,8 @@ pub mod producer;
 
 #[cfg(not(loom))]
 pub mod control;
+#[cfg(not(loom))]
+pub mod handshake;
 #[cfg(all(unix, not(loom)))]
 pub mod segment;
 

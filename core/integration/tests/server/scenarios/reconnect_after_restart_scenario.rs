@@ -197,11 +197,23 @@ fn create_client(harness: &TestHarness) -> IggyClient {
     let server = harness.server();
 
     let addr = match transport {
-        TransportProtocol::Tcp => server.tcp_addr().expect("TCP address not available"),
-        TransportProtocol::Quic => server.quic_addr().expect("QUIC address not available"),
+        TransportProtocol::Tcp => server
+            .tcp_addr()
+            .expect("TCP address not available")
+            .to_string(),
+        TransportProtocol::Quic => server
+            .quic_addr()
+            .expect("QUIC address not available")
+            .to_string(),
         TransportProtocol::WebSocket => server
             .websocket_addr()
-            .expect("WebSocket address not available"),
+            .expect("WebSocket address not available")
+            .to_string(),
+        TransportProtocol::Shm => server
+            .shm_socket()
+            .expect("shm socket not available")
+            .display()
+            .to_string(),
         TransportProtocol::Http => panic!("HTTP is stateless and does not support reconnect"),
     };
 
@@ -209,6 +221,7 @@ fn create_client(harness: &TestHarness) -> IggyClient {
         TransportProtocol::Tcp => "iggy",
         TransportProtocol::Quic => "iggy+quic",
         TransportProtocol::WebSocket => "iggy+ws",
+        TransportProtocol::Shm => "iggy+shm",
         TransportProtocol::Http => unreachable!(),
     };
 

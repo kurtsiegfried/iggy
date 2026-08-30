@@ -30,6 +30,8 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.get_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.get_stream(stream_id).await,
             ClientWrapper::WebSocket(client) => client.get_stream(stream_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.get_stream(stream_id).await,
         }
     }
 
@@ -40,6 +42,8 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.get_streams().await,
             ClientWrapper::Quic(client) => client.get_streams().await,
             ClientWrapper::WebSocket(client) => client.get_streams().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.get_streams().await,
         }
     }
 
@@ -50,6 +54,8 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.create_stream(name).await,
             ClientWrapper::Quic(client) => client.create_stream(name).await,
             ClientWrapper::WebSocket(client) => client.create_stream(name).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.create_stream(name).await,
         }
     }
 
@@ -67,6 +73,8 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::WebSocket(client) => {
                 client.update_stream(stream_id, name, options).await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.update_stream(stream_id, name, options).await,
         }
     }
 
@@ -77,6 +85,8 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.delete_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.delete_stream(stream_id).await,
             ClientWrapper::WebSocket(client) => client.delete_stream(stream_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.delete_stream(stream_id).await,
         }
     }
 
@@ -87,6 +97,8 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.purge_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.purge_stream(stream_id).await,
             ClientWrapper::WebSocket(client) => client.purge_stream(stream_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.purge_stream(stream_id).await,
         }
     }
 }

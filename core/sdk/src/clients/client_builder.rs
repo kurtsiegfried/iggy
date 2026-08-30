@@ -24,8 +24,12 @@ use crate::prelude::{
     WebSocketClientConfigBuilder,
 };
 use crate::quic::quic_client::QuicClient;
+#[cfg(unix)]
+use crate::shm::shm_client::ShmClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
+#[cfg(unix)]
+use iggy_common::ShmClientConfigBuilder;
 use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;
 use tracing::error;
@@ -70,6 +74,14 @@ impl IggyClientBuilder {
                     WebSocketClient::from_connection_string(connection_string)?,
                 ));
             }
+            #[cfg(unix)]
+            TransportProtocol::Shm => {
+                builder.client = Some(ClientWrapper::Shm(
+                    crate::shm::shm_client::ShmClient::from_connection_string(connection_string)?,
+                ));
+            }
+            #[cfg(not(unix))]
+            TransportProtocol::Shm => return Err(IggyError::InvalidConnectionString),
         }
 
         Ok(builder)
@@ -129,6 +141,17 @@ impl IggyClientBuilder {
     pub fn with_websocket(self) -> WebSocketClientBuilder {
         WebSocketClientBuilder {
             config: WebSocketClientConfigBuilder::default(),
+            parent_builder: self,
+        }
+    }
+
+    /// This method provides fluent API for the shared-memory client configuration.
+    /// It returns the `ShmClientBuilder` instance, which allows to configure the shared-memory client with custom settings or using defaults.
+    /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(unix)]
+    pub fn with_shm(self) -> ShmClientBuilder {
+        ShmClientBuilder {
+            config: ShmClientConfigBuilder::default(),
             parent_builder: self,
         }
     }
@@ -406,6 +429,69 @@ impl WebSocketClientBuilder {
         let client = self
             .parent_builder
             .with_client(ClientWrapper::WebSocket(client))
+            .build()?;
+        Ok(client)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct ShmClientBuilder {
+    config: ShmClientConfigBuilder,
+    parent_builder: IggyClientBuilder,
+}
+
+#[cfg(unix)]
+impl ShmClientBuilder {
+    /// Sets the server socket path for the shared-memory client.
+    pub fn with_server_address(mut self, server_address: String) -> Self {
+        self.config = self.config.with_server_address(server_address);
+        self
+    }
+
+    /// Sets the auto sign in during connection.
+    pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
+        self.config = self.config.with_auto_sign_in(auto_sign_in);
+        self
+    }
+
+    /// Sets the number of max retries when connecting to the server.
+    pub fn with_reconnection_max_retries(mut self, reconnection_retries: Option<u32>) -> Self {
+        self.config = self
+            .config
+            .with_reconnection_max_retries(reconnection_retries);
+        self
+    }
+
+    /// Sets the interval between retries when connecting to the server.
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
+        self.config = self
+            .config
+            .with_reconnection_interval(reconnection_interval);
+        self
+    }
+
+    /// Sets the cooldown before reconnecting after a previously successful connection.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.config = self.config.with_reestablish_after(reestablish_after);
+        self
+    }
+
+    /// Sets the heartbeat interval.
+    pub fn with_heartbeat_interval(mut self, heartbeat_interval: NonZeroIggyDuration) -> Self {
+        self.config = self.config.with_heartbeat_interval(heartbeat_interval);
+        self
+    }
+
+    /// Builds the parent `IggyClient` with shared-memory configuration.
+    pub fn build(self) -> Result<IggyClient, IggyError> {
+        let client = ShmClient::create(Arc::new(self.config.build()?))?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Shm(client))
             .build()?;
         Ok(client)
     }

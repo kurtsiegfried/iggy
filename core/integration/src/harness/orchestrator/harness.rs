@@ -653,6 +653,7 @@ impl TestHarness {
             TransportProtocol::Http => server.http_client(),
             TransportProtocol::Quic => server.quic_client(),
             TransportProtocol::WebSocket => server.websocket_client(),
+            TransportProtocol::Shm => server.shm_client(),
         }
     }
 
@@ -680,6 +681,7 @@ impl TestHarness {
             TransportProtocol::Http => server.http_client()?,
             TransportProtocol::Quic => server.quic_client()?,
             TransportProtocol::WebSocket => server.websocket_client()?,
+            TransportProtocol::Shm => server.shm_client()?,
         };
         builder.connect().await
     }
@@ -698,6 +700,10 @@ impl TestHarness {
 
     pub async fn websocket_root_client(&self) -> Result<IggyClient, TestBinaryError> {
         self.root_client_for(TransportProtocol::WebSocket).await
+    }
+
+    pub async fn shm_root_client(&self) -> Result<IggyClient, TestBinaryError> {
+        self.root_client_for(TransportProtocol::Shm).await
     }
 
     pub fn transport(&self) -> Result<TransportProtocol, TestBinaryError> {
@@ -772,6 +778,10 @@ impl TestHarness {
         self.new_client_for(TransportProtocol::WebSocket).await
     }
 
+    pub async fn shm_new_client(&self) -> Result<IggyClient, TestBinaryError> {
+        self.new_client_for(TransportProtocol::Shm).await
+    }
+
     pub async fn websocket_root_clients(
         &self,
         count: usize,
@@ -791,6 +801,10 @@ impl TestHarness {
                 TransportProtocol::Http => server.http_addr(),
                 TransportProtocol::Quic => server.quic_addr(),
                 TransportProtocol::WebSocket => server.websocket_addr(),
+                // Path-addressed; `ClientHandle` slots are `SocketAddr`
+                // only, and the arm below turns None into the clear
+                // "transport not available" error.
+                TransportProtocol::Shm => None,
             };
 
             let Some(address) = address else {
@@ -825,6 +839,7 @@ impl TestHarness {
                 TransportProtocol::Http => server.http_addr(),
                 TransportProtocol::Quic => server.quic_addr(),
                 TransportProtocol::WebSocket => server.websocket_addr(),
+                TransportProtocol::Shm => None,
             };
 
             if let Some(addr) = address {

@@ -23,11 +23,13 @@ use crate::prelude::{
     QuicClientReconnectionConfig, TcpClientConfig, TcpClientReconnectionConfig, WebSocketClient,
 };
 use crate::quic::quic_client::QuicClient;
+#[cfg(unix)]
+use crate::shm::shm_client::ShmClient;
 use crate::tcp::tcp_client::TcpClient;
 use iggy_common::Client;
 use iggy_common::{
-    AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
-    WebSocketClientReconnectionConfig, WebSocketConfig,
+    AutoLogin, Credentials, ShmClientConfig, ShmClientReconnectionConfig, TransportProtocol,
+    WebSocketClientConfig, WebSocketClientReconnectionConfig, WebSocketConfig,
 };
 use secrecy::SecretString;
 use std::str::FromStr;
@@ -51,6 +53,8 @@ pub struct ClientProviderConfig {
     pub tcp: Option<Arc<TcpClientConfig>>,
     /// The optional configuration for the WebSocket transport.
     pub websocket: Option<Arc<WebSocketClientConfig>>,
+    /// The optional configuration for the shared-memory transport.
+    pub shm: Option<Arc<ShmClientConfig>>,
 }
 
 impl Default for ClientProviderConfig {
@@ -61,6 +65,7 @@ impl Default for ClientProviderConfig {
             quic: Some(Arc::new(QuicClientConfig::default())),
             tcp: Some(Arc::new(TcpClientConfig::default())),
             websocket: Some(Arc::new(WebSocketClientConfig::default())),
+            shm: Some(Arc::new(ShmClientConfig::default())),
         }
     }
 }
@@ -85,6 +90,7 @@ impl ClientProviderConfig {
             quic: None,
             tcp: None,
             websocket: None,
+            shm: None,
         };
         match config.transport {
             TransportProtocol::Quic => {
@@ -149,6 +155,31 @@ impl ClientProviderConfig {
                             .map_err(|_| IggyError::InvalidConfiguration)?,
                         reestablish_after: IggyDuration::from_str(
                             &args.tcp_reconnection_reestablish_after,
+                        )
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
+                    },
+                    auto_login: if auto_login {
+                        AutoLogin::Enabled(Credentials::UsernamePassword(
+                            args.username,
+                            SecretString::from(args.password),
+                        ))
+                    } else {
+                        AutoLogin::Disabled
+                    },
+                }));
+            }
+            TransportProtocol::Shm => {
+                config.shm = Some(Arc::new(ShmClientConfig {
+                    server_address: args.shm_socket,
+                    heartbeat_interval: NonZeroIggyDuration::from_str(&args.shm_heartbeat_interval)
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
+                    reconnection: ShmClientReconnectionConfig {
+                        enabled: args.shm_reconnection_enabled,
+                        max_retries: args.shm_reconnection_max_retries,
+                        interval: NonZeroIggyDuration::from_str(&args.shm_reconnection_interval)
+                            .map_err(|_| IggyError::InvalidConfiguration)?,
+                        reestablish_after: IggyDuration::from_str(
+                            &args.shm_reconnection_reestablish_after,
                         )
                         .map_err(|_| IggyError::InvalidConfiguration)?,
                     },
@@ -255,5 +286,16 @@ pub async fn get_raw_client(
             };
             Ok(ClientWrapper::WebSocket(client))
         }
+        #[cfg(unix)]
+        TransportProtocol::Shm => {
+            let shm_config = config.shm.as_ref().unwrap();
+            let client = ShmClient::create(shm_config.clone())?;
+            if establish_connection {
+                Client::connect(&client).await?
+            };
+            Ok(ClientWrapper::Shm(client))
+        }
+        #[cfg(not(unix))]
+        TransportProtocol::Shm => Err(ClientError::InvalidTransport("shm".to_string())),
     }
 }

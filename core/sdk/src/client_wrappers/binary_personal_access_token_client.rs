@@ -32,6 +32,8 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.get_personal_access_tokens().await,
             ClientWrapper::Quic(client) => client.get_personal_access_tokens().await,
             ClientWrapper::WebSocket(client) => client.get_personal_access_tokens().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.get_personal_access_tokens().await,
         }
     }
 
@@ -48,6 +50,8 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::WebSocket(client) => {
                 client.create_personal_access_token(name, expiry).await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.create_personal_access_token(name, expiry).await,
         }
     }
 
@@ -58,6 +62,8 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.delete_personal_access_token(name).await,
             ClientWrapper::Quic(client) => client.delete_personal_access_token(name).await,
             ClientWrapper::WebSocket(client) => client.delete_personal_access_token(name).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.delete_personal_access_token(name).await,
         }
     }
 
@@ -73,6 +79,8 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::WebSocket(client) => {
                 client.login_with_personal_access_token(token).await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.login_with_personal_access_token(token).await,
         }
     }
 }

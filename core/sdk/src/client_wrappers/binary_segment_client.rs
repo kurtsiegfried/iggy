@@ -55,6 +55,12 @@ impl SegmentClient for ClientWrapper {
                     .delete_segments(stream_id, topic_id, partition_id, segments_count)
                     .await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
+                client
+                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
+                    .await
+            }
         }
     }
 }

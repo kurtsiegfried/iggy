@@ -113,6 +113,12 @@ impl IggyClient {
             TransportProtocol::WebSocket => Ok(IggyClient::new(ClientWrapper::WebSocket(
                 WebSocketClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(unix)]
+            TransportProtocol::Shm => Ok(IggyClient::new(ClientWrapper::Shm(
+                crate::shm::shm_client::ShmClient::from_connection_string(connection_string)?,
+            ))),
+            #[cfg(not(unix))]
+            TransportProtocol::Shm => Err(IggyError::InvalidConnectionString),
         }
     }
 
@@ -218,6 +224,8 @@ impl IggyClient {
             ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::WebSocket(client) => client.send_raw_with_response(code, payload).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
         }
     }
@@ -232,6 +240,8 @@ impl IggyClient {
     ) -> Result<Bytes, IggyError> {
         match &*self.client.read().await {
             ClientWrapper::Http(client) => client.send_http_request(method, path, body).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(_) => Err(IggyError::FeatureUnavailable),
             ClientWrapper::Tcp(_)
             | ClientWrapper::Quic(_)
             | ClientWrapper::WebSocket(_)

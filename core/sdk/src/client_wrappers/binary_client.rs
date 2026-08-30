@@ -30,6 +30,8 @@ impl Client for ClientWrapper {
             ClientWrapper::Tcp(client) => client.connect().await,
             ClientWrapper::Quic(client) => client.connect().await,
             ClientWrapper::WebSocket(client) => client.connect().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.connect().await,
         }
     }
 
@@ -40,6 +42,8 @@ impl Client for ClientWrapper {
             ClientWrapper::Tcp(client) => client.disconnect().await,
             ClientWrapper::Quic(client) => client.disconnect().await,
             ClientWrapper::WebSocket(client) => client.disconnect().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.disconnect().await,
         }
     }
 
@@ -50,6 +54,8 @@ impl Client for ClientWrapper {
             ClientWrapper::Tcp(client) => client.shutdown().await,
             ClientWrapper::Quic(client) => client.shutdown().await,
             ClientWrapper::WebSocket(client) => client.shutdown().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.shutdown().await,
         }
     }
 
@@ -60,6 +66,8 @@ impl Client for ClientWrapper {
             ClientWrapper::Tcp(client) => client.subscribe_events().await,
             ClientWrapper::Quic(client) => client.subscribe_events().await,
             ClientWrapper::WebSocket(client) => client.subscribe_events().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.subscribe_events().await,
         }
     }
 }

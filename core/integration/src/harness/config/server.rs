@@ -27,6 +27,8 @@ pub struct TestServerConfig {
     pub websocket_enabled: bool,
     #[builder(default = true)]
     pub http_enabled: bool,
+    #[builder(default = true)]
+    pub shm_enabled: bool,
     pub encryption: Option<EncryptionConfig>,
     pub tls: Option<TlsConfig>,
     pub websocket_tls: Option<TlsConfig>,

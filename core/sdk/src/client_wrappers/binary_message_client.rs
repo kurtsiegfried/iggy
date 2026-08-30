@@ -101,6 +101,20 @@ impl MessageClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
+                client
+                    .poll_messages(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        consumer,
+                        strategy,
+                        count,
+                        auto_commit,
+                    )
+                    .await
+            }
         }
     }
 
@@ -137,6 +151,12 @@ impl MessageClient for ClientWrapper {
                     .send_messages(stream_id, topic_id, partitioning, messages)
                     .await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
+                client
+                    .send_messages(stream_id, topic_id, partitioning, messages)
+                    .await
+            }
         }
     }
 
@@ -169,6 +189,12 @@ impl MessageClient for ClientWrapper {
                     .await
             }
             ClientWrapper::WebSocket(client) => {
+                client
+                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
+                    .await
+            }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
                 client
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
                     .await

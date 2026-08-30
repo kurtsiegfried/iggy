@@ -35,6 +35,8 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.get_topic(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.get_topic(stream_id, topic_id).await,
             ClientWrapper::WebSocket(client) => client.get_topic(stream_id, topic_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.get_topic(stream_id, topic_id).await,
         }
     }
 
@@ -45,6 +47,8 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.get_topics(stream_id).await,
             ClientWrapper::Quic(client) => client.get_topics(stream_id).await,
             ClientWrapper::WebSocket(client) => client.get_topics(stream_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.get_topics(stream_id).await,
         }
     }
 
@@ -60,6 +64,8 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.create_topic(stream_id, name, options).await,
             ClientWrapper::Quic(client) => client.create_topic(stream_id, name, options).await,
             ClientWrapper::WebSocket(client) => client.create_topic(stream_id, name, options).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.create_topic(stream_id, name, options).await,
         }
     }
 
@@ -96,6 +102,12 @@ impl TopicClient for ClientWrapper {
                     .update_topic(stream_id, topic_id, name, options)
                     .await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
+                client
+                    .update_topic(stream_id, topic_id, name, options)
+                    .await
+            }
         }
     }
 
@@ -110,6 +122,8 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.delete_topic(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.delete_topic(stream_id, topic_id).await,
             ClientWrapper::WebSocket(client) => client.delete_topic(stream_id, topic_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.delete_topic(stream_id, topic_id).await,
         }
     }
 
@@ -124,6 +138,8 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.purge_topic(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.purge_topic(stream_id, topic_id).await,
             ClientWrapper::WebSocket(client) => client.purge_topic(stream_id, topic_id).await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.purge_topic(stream_id, topic_id).await,
         }
     }
 }

@@ -41,6 +41,8 @@ pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
 pub use crate::consumer_ext::IggyConsumerMessageExt;
+#[cfg(unix)]
+pub use crate::shm::shm_client::ShmClient;
 pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
@@ -60,11 +62,12 @@ pub use iggy_common::{
     Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
     PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
     QuicClientReconnectionConfig, ResourceOptions, SendMessages, SendMessagesConfirmationResponse,
-    SendMessagesResponse, Sizeable, SnapshotCompression, Stats, Stream, StreamDetails,
-    StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,
-    TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
-    TopicPermissions, TopicUpdateOptions, TransportEndpoints, TransportProtocol, UserId, UserInfo,
-    UserInfoDetails, UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
+    SendMessagesResponse, ShmClientConfig, ShmClientConfigBuilder, ShmClientReconnectionConfig,
+    Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
+    StreamUpdateOptions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
+    TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails, TopicPermissions,
+    TopicUpdateOptions, TransportEndpoints, TransportProtocol, UserId, UserInfo, UserInfoDetails,
+    UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
     WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
     topic_option_keys,
 };

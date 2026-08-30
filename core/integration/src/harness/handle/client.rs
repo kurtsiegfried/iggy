@@ -106,6 +106,11 @@ impl ClientHandle {
             TransportProtocol::Quic => self.create_quic_client().await,
             TransportProtocol::Http => self.create_http_client().await,
             TransportProtocol::WebSocket => self.create_websocket_client().await,
+            // `ClientHandle` is addressed by `SocketAddr`; shm clients are
+            // path-addressed and go through `ServerHandle::shm_client`.
+            TransportProtocol::Shm => Err(TestBinaryError::InvalidState {
+                message: "Shm clients are created through ServerHandle::shm_client".to_string(),
+            }),
         }
     }
 
