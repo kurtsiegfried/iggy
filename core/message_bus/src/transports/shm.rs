@@ -65,7 +65,7 @@
 //! slot; genuinely idle clients keep the heartbeat word moving. The
 //! doorbell write is timeout-bounded (its trigger is client-writable
 //! memory), and doorbell wakes that keep producing no work are paced
-//! so a control-socket byte flood buys wall clock, not shard-0 CPU.
+//! so a control-socket byte flood buys wall clock, not owning-shard CPU.
 
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::ptr::NonNull;
@@ -104,7 +104,7 @@ const DOORBELL_WRITE_GRACE: Duration = Duration::from_secs(1);
 
 /// Consecutive doorbell wakes that produced no work before the pump
 /// starts pacing itself. A byte flood on the control socket otherwise
-/// converts directly into empty drain cycles on the shared shard-0
+/// converts directly into empty drain cycles on the owning shard's shared
 /// executor; past this budget each further empty wake costs the
 /// flooder [`FLOOD_BACKOFF`] of wall clock instead.
 const EMPTY_WAKE_BUDGET: u32 = 8;
@@ -572,7 +572,7 @@ async fn run_pump(
             PumpWake::Doorbell => {
                 // A doorbell that keeps producing no work is a byte
                 // flood on the control socket; pace the pump so the
-                // flooder pays wall clock instead of shard-0 CPU. The
+                // flooder pays wall clock instead of owning-shard CPU. The
                 // counter resets on any real progress above.
                 empty_doorbell_wakes = empty_doorbell_wakes.saturating_add(1);
                 if empty_doorbell_wakes > EMPTY_WAKE_BUDGET {

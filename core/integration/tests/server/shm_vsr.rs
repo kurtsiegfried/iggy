@@ -108,6 +108,48 @@ async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_sem
     .unwrap();
 }
 
+// No explicit socket: an explicit path would be shared by every node
+// of the default cluster (last binder wins), while the harness assigns
+// each node its own. Node 0's socket keeps the connections and the
+// stdout assertions on the same process.
+#[iggy_harness]
+async fn given_several_shm_clients_when_connecting_should_delegate_to_owning_shards(
+    harness: &integration::harness::TestHarness,
+) {
+    const CLIENTS: usize = 4;
+    let server = harness.server();
+    let socket_path = server
+        .shm_socket()
+        .expect("test servers enable shm with a per-node socket")
+        .display()
+        .to_string();
+    let clients = tokio::task::spawn_blocking(move || {
+        let mut clients = Vec::with_capacity(CLIENTS);
+        for _ in 0..CLIENTS {
+            let mut client = RawShmClient::connect(&socket_path);
+            let ping = request_frame(ping_header(0xC0FFEE, HEADER_SIZE), &[]);
+            client.send_frame(&ping);
+            assert_eq!(reply_status(&client.recv_frame()), 0);
+            clients.push(client);
+        }
+        clients
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        server.stdout_occurrences("shm client delegated"),
+        CLIENTS,
+        "every accepted shm connection must take the delegate path"
+    );
+    assert_eq!(
+        server.stdout_occurrences("installing delegated shm client fd"),
+        CLIENTS,
+        "every delegated fd must be installed by an owning shard"
+    );
+    drop(clients);
+}
+
 #[iggy_harness(server(
     shm.enabled = "true",
     shm.socket = "/tmp/iggy-shm-cap.sock",

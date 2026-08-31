@@ -345,6 +345,15 @@ impl ConnectionInstaller for SharedSimOutbox {
         panic!("simulator has no fd transfer: ws client install is unreachable");
     }
 
+    fn install_client_shm_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _on_request: RequestHandler,
+    ) {
+        panic!("simulator has no fd transfer: shm client install is unreachable");
+    }
+
     // Real, unlike the fd installs above: dispatch reads client_meta to seed
     // the session manager, and registers the disconnect callback the harness
     // fires. Both delegate to the in-memory registry on the inner outbox.
