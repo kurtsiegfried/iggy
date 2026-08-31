@@ -93,8 +93,18 @@ impl ConnectionStringOptions for ShmConnectionStringOptions {
     /// grammar does not apply. Require an absolute path: a relative one
     /// silently depends on the process working directory and would connect
     /// to a different socket than the operator configured on the server.
+    /// A path that cannot fit `sun_path` or carries an interior NUL is
+    /// refused here with the grammar error instead of failing later at
+    /// connect with an opaque OS error.
     fn validate_server_address(server_address: &str) -> Result<(), IggyError> {
-        if !server_address.starts_with('/') {
+        // The tightest supported `sun_path` (104 bytes on the BSDs and
+        // macOS) minus the terminating NUL.
+        const MAX_SOCKET_PATH_LEN: usize = 103;
+
+        if !server_address.starts_with('/')
+            || server_address.len() > MAX_SOCKET_PATH_LEN
+            || server_address.contains('\0')
+        {
             return Err(IggyError::InvalidConnectionString);
         }
         Ok(())
@@ -168,6 +178,20 @@ mod tests {
     #[test]
     fn should_fail_with_an_unknown_option() {
         let value = "iggy+shm://user:secret@/tmp/iggy-shm.sock?nodelay=true";
+        let connection_string = ConnectionString::<ShmConnectionStringOptions>::new(value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_a_path_too_long_for_sun_path() {
+        let value = format!("iggy+shm://user:secret@/{}", "a".repeat(120));
+        let connection_string = ConnectionString::<ShmConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_an_interior_nul_in_the_path() {
+        let value = "iggy+shm://user:secret@/tmp/iggy\0shm.sock";
         let connection_string = ConnectionString::<ShmConnectionStringOptions>::new(value);
         assert!(connection_string.is_err());
     }

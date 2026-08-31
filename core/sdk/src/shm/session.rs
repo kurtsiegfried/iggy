@@ -80,6 +80,14 @@ const HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 pub(crate) struct ExchangeRequest {
     /// A fully encoded consensus frame, appended to the log verbatim.
     pub frame: Bytes,
+    /// Whether `TransientNotAccepted` replays for the full response
+    /// budget instead of surfacing after
+    /// [`NOT_ACCEPTED_SURFACE_INTERVAL`]. Login/register sets this,
+    /// mirroring the network transports: during an election the whole
+    /// cluster answers not-accepted, and failing the sign-in after 2s
+    /// would fail every reconnect that lands inside the election
+    /// window.
+    pub full_not_accepted_budget: bool,
     pub reply: oneshot::Sender<Result<Bytes, IggyError>>,
 }
 
@@ -253,7 +261,12 @@ fn connect(socket_path: &Path) -> Result<Session, IggyError> {
 fn serve(mut session: Session, commands: &Receiver<ExchangeRequest>, response_timeout: Duration) {
     loop {
         match commands.recv_timeout(HEARTBEAT_TICK) {
-            Ok(exchange) => match run_exchange(&mut session, &exchange.frame, response_timeout) {
+            Ok(exchange) => match run_exchange(
+                &mut session,
+                &exchange.frame,
+                response_timeout,
+                exchange.full_not_accepted_budget,
+            ) {
                 Ok(reply) => {
                     let _ = exchange.reply.send(Ok(reply));
                 }
@@ -277,6 +290,7 @@ fn run_exchange(
     session: &mut Session,
     frame: &Bytes,
     response_timeout: Duration,
+    full_not_accepted_budget: bool,
 ) -> Result<Bytes, ExchangeError> {
     if frame.len() > session.max_message_size {
         return Err(ExchangeError::Reply(IggyError::TooBigMessagePayload));
@@ -285,7 +299,11 @@ fn run_exchange(
     // replays, mirroring the network transports. Replays reuse the same
     // encoded frame so the request id stays stable for server dedup.
     let deadline = Instant::now() + response_timeout;
-    let not_accepted_deadline = Instant::now() + NOT_ACCEPTED_SURFACE_INTERVAL;
+    let not_accepted_deadline = if full_not_accepted_budget {
+        deadline
+    } else {
+        Instant::now() + NOT_ACCEPTED_SURFACE_INTERVAL
+    };
     loop {
         append_frame(session, frame, deadline)?;
         ring_if_parked(session)?;
@@ -354,6 +372,12 @@ fn append_frame(
     }
 }
 
+/// The next committed frame IS the reply: correlation is by order
+/// alone, with no request-id match. This leans on the server pump's
+/// contract of exactly one reply frame per request, in order, with no
+/// unsolicited frames on this log; a server that ever pushes an
+/// asynchronous frame here would silently shift every later reply by
+/// one. Revisit with a request-id echo if that contract ever loosens.
 fn read_reply(session: &mut Session, deadline: Instant) -> Result<Vec<u8>, ExchangeError> {
     loop {
         if let Some(reply) = poll_one(session)? {
@@ -465,8 +489,23 @@ fn wait_for_doorbell(session: &mut Session, deadline: Instant) -> Result<(), Exc
 fn recv_welcome_with_fd(
     stream: &UnixStream,
 ) -> Result<([u8; WELCOME_LEN], Option<OwnedFd>), IggyError> {
+    // The kernel writes cmsghdr structures into this buffer and the
+    // parse below forms references to them, so it must carry cmsghdr
+    // alignment; a bare byte array only aligns to 1. Same reasoning as
+    // the server's aligned SCM_RIGHTS send buffer.
+    #[repr(C, align(8))]
+    struct AlignedCmsgBuffer([u8; 64]);
+
+    // Linux can suppress fd inheritance atomically at receive time;
+    // elsewhere `from_received_fd` sets FD_CLOEXEC right after, with
+    // the unavoidable fork+exec window in between.
+    #[cfg(target_os = "linux")]
+    const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    const RECV_FLAGS: libc::c_int = 0;
+
     let mut payload = [0u8; WELCOME_LEN];
-    let mut control = [0u8; 64];
+    let mut control = AlignedCmsgBuffer([0u8; 64]);
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: payload.len(),
@@ -474,14 +513,14 @@ fn recv_welcome_with_fd(
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
     #[allow(clippy::cast_possible_truncation)]
     // socklen_t is u32 on some unix targets; 64 always fits.
     {
-        message.msg_controllen = control.len() as _;
+        message.msg_controllen = control.0.len() as _;
     }
 
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, 0) };
+    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, RECV_FLAGS) };
     if received < 0 {
         debug!(
             "recvmsg on the shm welcome failed: {}",
@@ -498,8 +537,9 @@ fn recv_welcome_with_fd(
     let fd = if header.is_null() {
         None
     } else {
-        // Safety: CMSG_FIRSTHDR returned a non-null header inside the
-        // control buffer the kernel just filled.
+        // Safety: CMSG_FIRSTHDR returned a non-null header at the start
+        // of the control buffer the kernel just filled, and the buffer
+        // carries cmsghdr alignment.
         let header_ref = unsafe { &*header };
         if header_ref.cmsg_level != libc::SOL_SOCKET || header_ref.cmsg_type != libc::SCM_RIGHTS {
             return Err(IggyError::CannotEstablishConnection);

@@ -99,6 +99,19 @@ impl AnonymousSegment {
             ));
         }
         require_resize_seals(&fd)?;
+        // recvmsg installs the fd without close-on-exec unless the
+        // receiver asked for it, and only Linux can ask atomically
+        // (MSG_CMSG_CLOEXEC). Set it here so every adopted segment
+        // honors the same no-inherit invariant the creating side
+        // establishes with MFD_CLOEXEC: a child of a fork+exec must
+        // not keep the segment, and the admission slot it pins, alive
+        // past the parent's disconnect. On platforms without the
+        // atomic receive flag a thread racing fork+exec between
+        // recvmsg and this call can still leak; that residual window
+        // is the platform's, not this adopter's.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(Self {
             fd,
             len: expected_len,
@@ -413,6 +426,32 @@ mod tests {
         let cloned = segment.as_fd().try_clone_to_owned().unwrap();
         let adopted = AnonymousSegment::from_received_fd(cloned, SEGMENT_PAGE_SIZE).unwrap();
         assert_eq!(adopted.len(), SEGMENT_PAGE_SIZE);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "miri cannot operate on file-backed segments")]
+    fn an_adopted_fd_is_close_on_exec() {
+        let segment = AnonymousSegment::allocate(SEGMENT_PAGE_SIZE).unwrap();
+        // A plain dup drops FD_CLOEXEC, exactly like an fd freshly
+        // installed by a recvmsg without MSG_CMSG_CLOEXEC.
+        let raw = unsafe { libc::dup(segment.as_fd().as_raw_fd()) };
+        assert!(raw >= 0, "dup failed");
+        // Safety: dup just returned this fd; nothing else owns it.
+        let received = unsafe { OwnedFd::from_raw_fd(raw) };
+        let flags = unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the dup must start without close-on-exec for this test to prove anything"
+        );
+
+        let adopted = AnonymousSegment::from_received_fd(received, SEGMENT_PAGE_SIZE).unwrap();
+        let flags = unsafe { libc::fcntl(adopted.as_fd().as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "adoption must set close-on-exec so a fork+exec child cannot keep the segment"
+        );
     }
 
     #[test]

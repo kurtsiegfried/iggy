@@ -204,8 +204,13 @@ impl RawShmClient {
 
 /// Blocking `recvmsg` for the fixed-size welcome plus one optional fd.
 fn recv_with_fd(stream: &StdUnixStream, payload_len: usize) -> (Vec<u8>, Option<OwnedFd>) {
+    // cmsghdr references are formed into this buffer below, so it
+    // must carry cmsghdr alignment; a bare byte array aligns to 1.
+    #[repr(C, align(8))]
+    struct AlignedCmsgBuffer([u8; 64]);
+
     let mut payload = vec![0u8; payload_len];
-    let mut control = [0u8; 64];
+    let mut control = AlignedCmsgBuffer([0u8; 64]);
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: payload.len(),
@@ -213,11 +218,11 @@ fn recv_with_fd(stream: &StdUnixStream, payload_len: usize) -> (Vec<u8>, Option<
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    message.msg_control = control.0.as_mut_ptr().cast::<libc::c_void>();
     #[allow(clippy::cast_possible_truncation)]
     // socklen_t is u32 on some unix targets; 64 always fits.
     {
-        message.msg_controllen = control.len() as _;
+        message.msg_controllen = control.0.len() as _;
     }
 
     let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, 0) };

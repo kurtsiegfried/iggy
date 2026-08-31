@@ -484,6 +484,7 @@ impl ShmClient {
             let (reply_tx, reply_rx) = oneshot::channel();
             if !handle.submit(ExchangeRequest {
                 frame: request,
+                full_not_accepted_budget: is_login_register_code(code),
                 reply: reply_tx,
             }) {
                 return Err(IggyError::Disconnected);
