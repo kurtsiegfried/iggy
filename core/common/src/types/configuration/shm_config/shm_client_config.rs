@@ -37,8 +37,12 @@ pub struct ShmClientConfig {
 impl Default for ShmClientConfig {
     fn default() -> Self {
         ShmClientConfig {
-            // The server's default `[shm]` socket, resolved against the
-            // server's working directory when relative.
+            // Mirrors the server's default `[shm]` socket spelling. As
+            // client config the path resolves against THIS process's
+            // working directory at connect, so the default only lines
+            // up when the client runs from the server's directory;
+            // connection strings require an absolute path for exactly
+            // that reason, and programmatic config is left permissive.
             server_address: "local_data/runtime/iggy-shm.sock".to_string(),
             auto_login: AutoLogin::Disabled,
             reconnection: ShmClientReconnectionConfig::default(),

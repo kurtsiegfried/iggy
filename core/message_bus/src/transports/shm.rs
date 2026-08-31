@@ -423,6 +423,11 @@ async fn run_pump(
         }
 
         // Outbound: append bus replies into the server-to-client log.
+        // Contract: exactly one frame per client request, in request
+        // order, and nothing unsolicited (evictions ride as the
+        // request's reply). The SDK correlates replies by order alone,
+        // so an asynchronous frame pushed here would silently shift
+        // every later reply by one on the client.
         loop {
             let frame = match pending_outbound.take() {
                 Some(frame) => frame,
