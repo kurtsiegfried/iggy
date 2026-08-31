@@ -403,7 +403,17 @@ runs:
       run: |
         cargo +nightly-2026-04-21 miri test --locked \
           -p iggy_binary_protocol \
-          -p consensus
+          -p consensus \
+          -p shm
+      shell: bash
+
+    # Loom needs its own cfg and so runs in no other task; without
+    # this step a memory-ordering regression in shm merges green.
+    - name: Run loom model checks
+      if: inputs.task == 'miri'
+      env:
+        RUSTFLAGS: "--cfg loom"
+      run: cargo test --locked -p shm --release --test loom
       shell: bash
 
     # aarch64 builds (run on ARM64 runners)
