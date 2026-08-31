@@ -43,22 +43,28 @@ use shm::mem::RawLogMemory;
 use shm::producer::LogProducer;
 use shm::segment::{AnonymousSegment, SegmentMapping};
 
-const SOCKET_PATH: &str = "/tmp/iggy-shm-vsr.sock";
-const CAP_SOCKET_PATH: &str = "/tmp/iggy-shm-cap.sock";
 const HELLO_LEN: usize = 16;
 const WELCOME_LEN: usize = 48;
 const EVICTION_REASON_INCOMPATIBLE_PROTOCOL: u8 = 14;
 const WAIT_BUDGET: Duration = Duration::from_secs(10);
 
-#[iggy_harness(server(shm.enabled = "true", shm.socket = "/tmp/iggy-shm-vsr.sock"))]
+// The harness assigns each cluster node its own socket; an explicit
+// shm.socket attribute would be shared by every node of the default
+// cluster, whose binds then race for one sun_path.
+#[iggy_harness]
 async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_semantics(
     harness: &integration::harness::TestHarness,
 ) {
-    let _server = harness.server();
-    tokio::task::spawn_blocking(|| {
+    let socket_path = harness
+        .server()
+        .shm_socket()
+        .expect("test servers enable shm with a per-node socket")
+        .display()
+        .to_string();
+    tokio::task::spawn_blocking(move || {
         // Pre-auth ping, then a successful login-register, on one
         // connection: the pre-auth contract and the auth entry path.
-        let mut client = RawShmClient::connect(SOCKET_PATH);
+        let mut client = RawShmClient::connect(&socket_path);
 
         let ping = request_frame(ping_header(0xC0FFEE, HEADER_SIZE), &[]);
         client.send_frame(&ping);
@@ -79,7 +85,7 @@ async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_sem
         // A stale protocol version on a fresh connection: the version
         // gate answers with a typed eviction carrying the accepted
         // window, exactly like TCP.
-        let mut stale = RawShmClient::connect(SOCKET_PATH);
+        let mut stale = RawShmClient::connect(&socket_path);
         let stale_body = login_register_body(1);
         let stale_login = request_frame(
             register_header(0xBEEF, HEADER_SIZE + stale_body.len()),
@@ -108,40 +114,124 @@ async fn given_shm_client_when_ping_login_and_stale_version_should_match_tcp_sem
     .unwrap();
 }
 
-#[iggy_harness(server(
-    shm.enabled = "true",
-    shm.socket = "/tmp/iggy-shm-cap.sock",
-    shm.max_connections = "1"
-))]
+// No explicit socket: an explicit path would be shared by every node
+// of the default cluster (last binder wins), while the harness assigns
+// each node its own. Node 0's socket keeps the connections and the
+// stdout assertions on the same process.
+#[iggy_harness]
+async fn given_several_shm_clients_when_connecting_should_delegate_to_owning_shards(
+    harness: &integration::harness::TestHarness,
+) {
+    const CLIENTS: usize = 4;
+    let server = harness.server();
+    let socket_path = server
+        .shm_socket()
+        .expect("test servers enable shm with a per-node socket")
+        .display()
+        .to_string();
+    let clients = tokio::task::spawn_blocking(move || {
+        let mut clients = Vec::with_capacity(CLIENTS);
+        for _ in 0..CLIENTS {
+            let mut client = RawShmClient::connect(&socket_path);
+            let ping = request_frame(ping_header(0xC0FFEE, HEADER_SIZE), &[]);
+            client.send_frame(&ping);
+            assert_eq!(reply_status(&client.recv_frame()), 0);
+            clients.push(client);
+        }
+        clients
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        server.stdout_occurrences("shm client delegated"),
+        CLIENTS,
+        "every accepted shm connection must take the delegate path"
+    );
+    assert_eq!(
+        server.stdout_occurrences("installing delegated shm client fd"),
+        CLIENTS,
+        "every delegated fd must be installed by an owning shard"
+    );
+    let stdout = server.stdout_plain();
+    let owning_shards: std::collections::HashSet<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("installing delegated shm client fd"))
+        .filter_map(|line| {
+            let value = line.split("shard=").nth(1)?;
+            value.split(|c: char| !c.is_ascii_digit()).next()
+        })
+        .collect();
+    assert!(
+        owning_shards.len() >= 2,
+        "round-robin must spread connections over more than one shard, got {owning_shards:?}"
+    );
+    drop(clients);
+}
+
+#[iggy_harness(server(shm.max_connections = "1"))]
 async fn given_full_admission_cap_when_second_client_connects_should_be_refused(
     harness: &integration::harness::TestHarness,
 ) {
-    let _server = harness.server();
-    tokio::task::spawn_blocking(|| {
-        // First connection fills the cap and stays alive.
-        let mut first = RawShmClient::connect(CAP_SOCKET_PATH);
+    let socket_path = harness
+        .server()
+        .shm_socket()
+        .expect("test servers enable shm with a per-node socket")
+        .display()
+        .to_string();
+    tokio::task::spawn_blocking(move || {
+        // First connection fills the cap and stays alive. The install
+        // lives on whichever shard the delegation picked, so this also
+        // exercises admit-on-shard-0 against release-on-owning-shard.
+        let mut first = RawShmClient::connect(&socket_path);
         let ping = request_frame(ping_header(0xC0FFEE, HEADER_SIZE), &[]);
         first.send_frame(&ping);
         assert_eq!(reply_status(&first.recv_frame()), 0);
 
         // The second connection must be dropped before any WELCOME:
         // the cap exists because each connection pins segment memory.
-        let mut refused = UnixStream::connect(CAP_SOCKET_PATH).unwrap();
-        let mut hello = [0u8; HELLO_LEN];
-        hello[0..8].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
-        hello[8..12].copy_from_slice(&LAYOUT_VERSION.to_le_bytes());
-        refused.write_all(&hello).unwrap();
-        refused.set_read_timeout(Some(WAIT_BUDGET)).unwrap();
-        let mut probe = [0u8; 1];
-        let read = std::io::Read::read(&mut refused, &mut probe).unwrap();
-        assert_eq!(read, 0, "past the cap the server must close pre-WELCOME");
+        assert!(
+            !hello_gets_a_welcome(&socket_path),
+            "past the cap the server must close pre-WELCOME"
+        );
 
         // The admitted connection keeps working.
         first.send_frame(&ping);
         assert_eq!(reply_status(&first.recv_frame()), 0);
+
+        // Teardown must return the slot: after the admitted connection
+        // closes, the owning shard releases its ledger entry and a new
+        // connection is admitted again. Polled because the release
+        // races the EOF-driven teardown.
+        drop(first);
+        let deadline = Instant::now() + WAIT_BUDGET;
+        loop {
+            if hello_gets_a_welcome(&socket_path) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a closed connection never returned its admission slot"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     })
     .await
     .unwrap();
+}
+
+/// One admission probe: dial, send a valid HELLO, and report whether
+/// the server answers with a WELCOME (admitted) or closes pre-WELCOME
+/// (refused). The probe connection is dropped either way.
+fn hello_gets_a_welcome(socket_path: &str) -> bool {
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    let mut hello = [0u8; HELLO_LEN];
+    hello[0..8].copy_from_slice(&SEGMENT_MAGIC.to_le_bytes());
+    hello[8..12].copy_from_slice(&LAYOUT_VERSION.to_le_bytes());
+    stream.write_all(&hello).unwrap();
+    stream.set_read_timeout(Some(WAIT_BUDGET)).unwrap();
+    let mut probe = [0u8; 1];
+    std::io::Read::read(&mut stream, &mut probe).unwrap() != 0
 }
 
 fn ping_header(client: u128, total_size: usize) -> RequestHeader {

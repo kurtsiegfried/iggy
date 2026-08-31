@@ -20,7 +20,7 @@
 //! (TLS / WS / WSS / QUIC).
 
 use super::common::drain_rejected_registration;
-use super::conn_info::ClientConnMeta;
+use super::conn_info::{ClientConnMeta, ClientTransportKind};
 use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::lifecycle::{FusedShutdown, InstanceToken, Shutdown, ShutdownToken};
@@ -221,6 +221,14 @@ pub fn install_client_conn<C: TransportConn>(
             // `on_request` (which would route responses through the winner's
             // entry and silently misroute).
             install_aborted.set(true);
+            // The meta was never inserted, so teardown will not fire the
+            // shm ledger release; return the admitted slot here or it
+            // leaks for the process lifetime.
+            if meta.transport == ClientTransportKind::Shm
+                && let Some(admission) = bus.shm_admission()
+            {
+                admission.release();
+            }
             warn!(
                 client_id,
                 "duplicate client id in registry, dropping delegated fd \

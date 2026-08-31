@@ -91,7 +91,7 @@ impl Drop for DupedFd {
 /// # Errors
 ///
 /// Returns `io::Error` if the `fcntl(2)` syscall fails.
-pub fn dup_fd(stream: &TcpStream) -> io::Result<DupedFd> {
+pub fn dup_fd(stream: &impl AsRawFd) -> io::Result<DupedFd> {
     let original = stream.as_raw_fd();
     // SAFETY: F_DUPFD_CLOEXEC allocates the lowest-numbered free fd >= 0
     // referring to the same open file description as `original`, with
@@ -117,6 +117,18 @@ pub fn wrap_duped_fd(fd: DupedFd) -> TcpStream {
     // SAFETY: `DupedFd` guarantees `raw` is an open TCP fd whose
     // ownership is being transferred here. No other resource holds it.
     unsafe { TcpStream::from_raw_fd(raw) }
+}
+
+/// Wrap a previously duplicated unix-socket fd into a compio
+/// `UnixStream`, under the same runtime and ownership contract as
+/// [`wrap_duped_fd`].
+#[must_use]
+pub fn wrap_duped_unix_fd(fd: DupedFd) -> compio::net::UnixStream {
+    let raw = fd.into_raw();
+    // SAFETY: `DupedFd` guarantees `raw` is an open unix-socket fd
+    // whose ownership is being transferred here. No other resource
+    // holds it.
+    unsafe { compio::net::UnixStream::from_raw_fd(raw) }
 }
 
 /// Close a raw fd. Internal helper used by [`DupedFd::drop`].
