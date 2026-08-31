@@ -17,14 +17,16 @@
 
 //! Shared-memory client install path.
 //!
-//! Shard-0 terminal: the accepted unix socket, the segment, and both
-//! log endpoints all live on shard 0, like QUIC and the TLS family.
-//! The connection cap is enforced at the accept callback (the segment
-//! pins real memory, and only a shard-local population can be counted
-//! accurately), so this install path assumes admission already
-//! happened. The HELLO/WELCOME handshake and segment setup run inside
-//! [`ShmTransportConn::run`], bounded by `handshake_grace`, mirroring
-//! the WSS in-run handshake pattern.
+//! Runs on the connection's owning shard: shard 0 accepts and
+//! delegates the raw unix socket like plaintext TCP, and this install
+//! path is reached through the delegated-frame handler, so the
+//! segment and both log endpoints live where the connection is
+//! served. Admission against the `[shm]` connection cap already
+//! happened on shard 0 (the segment pins real memory, so the cap is
+//! process-wide, see `ShmAdmission`); teardown releases the slot when
+//! the connection's metadata is removed. The HELLO/WELCOME handshake
+//! and segment setup run inside [`ShmTransportConn::run`], bounded by
+//! `handshake_grace`, mirroring the WSS in-run handshake pattern.
 
 use std::rc::Rc;
 

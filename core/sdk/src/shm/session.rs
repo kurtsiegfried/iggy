@@ -380,7 +380,7 @@ fn append_frame(
 /// one. Revisit with a request-id echo if that contract ever loosens.
 fn read_reply(session: &mut Session, deadline: Instant) -> Result<Vec<u8>, ExchangeError> {
     loop {
-        if let Some(reply) = poll_one(session)? {
+        if let Some(reply) = spin_for_reply(session)? {
             return Ok(reply);
         }
         session.consumer.prepare_park();
@@ -398,6 +398,33 @@ fn read_reply(session: &mut Session, deadline: Instant) -> Result<Vec<u8>, Excha
                 session.consumer.cancel_park();
                 return Err(error);
             }
+        }
+    }
+}
+
+/// How long the I/O thread polls the reply log before declaring itself
+/// parked. While it spins, the parked flag stays clear, so a server
+/// that commits inside the window skips its doorbell write and this
+/// side skips its blocking read: the whole exchange completes without
+/// either wake syscall. The thread is dedicated to this connection and
+/// only spins while an exchange is in flight, so the budget costs one
+/// core for at most this long per reply.
+const REPLY_SPIN_BUDGET: Duration = Duration::from_micros(60);
+/// Polls between deadline checks; `Instant::now` costs more than the
+/// poll itself, so it is amortized across a small batch.
+const SPINS_PER_CLOCK_CHECK: u32 = 64;
+
+fn spin_for_reply(session: &mut Session) -> Result<Option<Vec<u8>>, ExchangeError> {
+    let spin_deadline = Instant::now() + REPLY_SPIN_BUDGET;
+    loop {
+        for _ in 0..SPINS_PER_CLOCK_CHECK {
+            if let Some(reply) = poll_one(session)? {
+                return Ok(Some(reply));
+            }
+            std::hint::spin_loop();
+        }
+        if Instant::now() >= spin_deadline {
+            return Ok(None);
         }
     }
 }

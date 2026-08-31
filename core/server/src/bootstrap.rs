@@ -779,6 +779,9 @@ pub fn bootstrap(
     // any shard's bus reads the same atomic slots that the owning
     // shard's installer / disconnect path writes.
     let owner_table = Arc::new(ReplicaOwnerTable::new());
+    // One shm admission ledger per process, for the same reason: shard 0
+    // admits at accept, the owning shard releases at teardown.
+    let shm_admission = Arc::new(message_bus::ShmAdmission::default());
 
     // Single-shot bundle handoff (see `MetadataHandoff`): shard 0 sends
     // one cloned `ServerMetadataBundle` per peer; each peer drains
@@ -824,6 +827,7 @@ pub fn bootstrap(
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
         let owner_table_for_shard = Arc::clone(&owner_table);
+        let shm_admission_for_shard = Arc::clone(&shm_admission);
         let metadata_handoff_for_shard = if shard_id == 0 {
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
@@ -861,6 +865,7 @@ pub fn bootstrap(
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
+                    shm_admission_for_shard,
                     metadata_view_for_shard,
                     shard_metrics_for_shard,
                 )
@@ -926,6 +931,7 @@ fn run_shard_thread(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    shm_admission: Arc<message_bus::ShmAdmission>,
     metadata_view: Arc<AtomicU64>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
@@ -969,6 +975,7 @@ fn run_shard_thread(
             metadata_handoff,
             barrier,
             owner_table,
+            shm_admission,
             metadata_view,
             shard_metrics_all,
         ))
@@ -998,6 +1005,7 @@ async fn shard_main(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    shm_admission: Arc<message_bus::ShmAdmission>,
     metadata_view: Arc<AtomicU64>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
@@ -1007,6 +1015,7 @@ async fn shard_main(
         config,
         owner_table,
     ));
+    bus.set_shm_admission(shm_admission);
     // Every shard can own a delegated replica connection, so every
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
@@ -3633,7 +3642,6 @@ fn make_shard_zero_client_accept_fns(
     let shm_bus = Rc::clone(bus);
     let quic_request = on_request.clone();
     let wss_request = on_request.clone();
-    let shm_request = on_request.clone();
     let tcp_tls_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
@@ -3688,22 +3696,32 @@ fn make_shard_zero_client_accept_fns(
         installer::install_client_wss(&wss_bus, meta, stream, tls_config, wss_request.clone());
     });
 
-    // Shared memory terminates locally on shard 0: the accept-time
-    // connection cap needs an accurately countable population, which
-    // only one shard's registry provides. A unix socket has no inet
-    // peer address, so the meta records a loopback placeholder; peer
-    // identity lives in the segment's control page.
+    // Shared memory delegates like plaintext TCP: only the accepted
+    // unix socket crosses shards, and the receiving shard's handshake
+    // allocates the segment on its own runtime. Admission is decided
+    // here first against the process-wide ledger, because a delegated
+    // population is no longer countable from any one shard's registry;
+    // the owning shard's bus releases the slot on teardown.
     let shm_coord = coord;
+    let shm_admission = shm_bus
+        .shm_admission()
+        .expect("bootstrap installs the shm admission ledger before the accept fns");
     let shm = Rc::new(move |stream: compio::net::UnixStream| {
         let cap = shm_bus.config().shm.max_connections;
-        let live = shm_bus.client_transport_count(ClientTransportKind::Shm);
-        if live >= cap {
-            warn!(live, cap, "shm connection refused: max_connections reached");
+        if !shm_admission.try_admit(cap) {
+            warn!(
+                live = shm_admission.live(),
+                cap, "shm connection refused: max_connections reached"
+            );
             return;
         }
-        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let meta = mint_client_meta(&shm_coord, peer_addr, ClientTransportKind::Shm);
-        installer::install_client_shm(&shm_bus, meta, stream, shm_request.clone());
+        match shm_coord.delegate_shm_client(stream) {
+            Ok(client_id) => info!(client_id, "shm client delegated"),
+            Err(error) => {
+                shm_admission.release();
+                warn!(error = ?error, "delegate_shm_client failed; dropping shm client");
+            }
+        }
     });
 
     LocalClientAcceptFns {

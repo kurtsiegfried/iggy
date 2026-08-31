@@ -51,10 +51,11 @@
 use crate::config::CoordinatorConfig;
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::{LifecycleFrame, ShardCtorError, ShardFrame, TaggedSender, validate_sender_ordering};
-use compio::net::TcpStream;
+use compio::net::{TcpStream, UnixStream};
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::{SendError, fd_transfer};
 use std::cell::Cell;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::warn;
 
@@ -371,6 +372,43 @@ impl ShardZeroCoordinator {
             warn!(
                 client_id,
                 target, "delegate_ws_client try_send failed: {e:?}"
+            );
+            return Err(SendError::RoutingFailed(target));
+        }
+
+        drop(stream);
+        Ok(client_id)
+    }
+
+    /// Ship a shared-memory client's pre-handshake unix socket to the
+    /// next round-robin target shard.
+    ///
+    /// Same wire path as [`Self::delegate_client`] but ships
+    /// [`LifecycleFrame::ClientShmConnectionSetup`] so the receiving
+    /// shard runs the HELLO/WELCOME handshake, allocating and mapping
+    /// the segment on its own runtime. A unix socket has no inet peer
+    /// address, so the meta records a loopback placeholder; peer
+    /// identity lives in the segment's control page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError::DupFailed`] if `dup(2)` fails and
+    /// [`SendError::RoutingFailed`] when the target shard's inbox
+    /// refuses the setup frame.
+    pub fn delegate_shm_client(&self, stream: UnixStream) -> Result<u128, SendError> {
+        let target = self.next_client_target();
+        let client_id = self.mint_client_id(target);
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+
+        let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
+        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Shm);
+        let setup = LifecycleFrame::ClientShmConnectionSetup { fd, meta };
+        if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+            self.metrics
+                .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
+            warn!(
+                client_id,
+                target, "delegate_shm_client try_send failed: {e:?}"
             );
             return Err(SendError::RoutingFailed(target));
         }

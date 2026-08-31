@@ -658,6 +658,48 @@ pub trait MessageBus {
     }
 }
 
+/// Process-wide admission ledger for shared-memory connections.
+///
+/// Every shm connection pins a mapped segment for its lifetime, so the
+/// `[shm]` `max_connections` cap must count the whole process, not one
+/// shard's registry: accepts happen on shard 0 while delegated
+/// connections live (and die) on their owning shards. Shard 0's accept
+/// path admits against this ledger and the owning shard's bus releases
+/// the slot when the connection's metadata is removed.
+#[derive(Debug, Default)]
+pub struct ShmAdmission {
+    live: std::sync::atomic::AtomicUsize,
+}
+
+impl ShmAdmission {
+    /// Claim one slot unless `cap` are already live. The
+    /// compare-exchange loop keeps concurrent accepts from admitting
+    /// past the cap between a load and an increment.
+    pub fn try_admit(&self, cap: usize) -> bool {
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < cap).then_some(live + 1)
+            })
+            .is_ok()
+    }
+
+    /// Return one slot. Saturates at zero: buses that never had the
+    /// ledger installed (single-shard tests driving the install path
+    /// directly) tear down connections no accept ever admitted.
+    pub fn release(&self) {
+        let _ = self
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                live.checked_sub(1)
+            });
+    }
+
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+}
+
 /// Production message bus backed by real TCP connections.
 ///
 /// Owns:
@@ -722,6 +764,12 @@ pub struct IggyMessageBus {
     /// [`Self::set_replica_handshake_ctx`]. Read by the
     /// `install_replica_{inbound,outbound}` paths on the owning shard.
     replica_handshake_ctx: OnceCell<replica::handshake::ReplicaHandshakeCtx>,
+    /// Process-wide shm admission ledger, installed once at bootstrap
+    /// via [`Self::set_shm_admission`]. Shard 0 admits against it at
+    /// accept; this bus releases a slot when an shm connection's
+    /// metadata is removed. Unset on single-shard tests, which do not
+    /// account admission.
+    shm_admission: OnceCell<Arc<ShmAdmission>>,
     /// Shard-0-global in-flight inbound handshake slots: slot id ->
     /// expiry deadline. Capped at [`MAX_INFLIGHT_REPLICA_HANDSHAKES`];
     /// expired entries are pruned lazily inside
@@ -845,6 +893,7 @@ impl IggyMessageBus {
             client_meta: RefCell::new(ahash::AHashMap::new()),
             owner_table,
             replica_handshake_ctx: OnceCell::new(),
+            shm_admission: OnceCell::new(),
             replica_handshake_slots: RefCell::new(ahash::AHashMap::new()),
             replica_slot_seq: Cell::new(0),
             pending_dials: RefCell::new(ahash::AHashMap::new()),
@@ -903,6 +952,27 @@ impl IggyMessageBus {
     #[must_use]
     pub fn replica_handshake_ctx(&self) -> Option<&replica::handshake::ReplicaHandshakeCtx> {
         self.replica_handshake_ctx.get()
+    }
+
+    /// Install the process-wide shm admission ledger. Bootstrap-only
+    /// wiring; same one-shot contract as
+    /// [`Self::set_replica_handshake_ctx`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same bus.
+    pub fn set_shm_admission(&self, admission: Arc<ShmAdmission>) {
+        assert!(
+            self.shm_admission.set(admission).is_ok(),
+            "shm_admission installed twice (bootstrap invariant)"
+        );
+    }
+
+    /// The ledger installed by [`Self::set_shm_admission`], or `None`
+    /// when the bootstrap never wired it (single-shard tests).
+    #[must_use]
+    pub fn shm_admission(&self) -> Option<Arc<ShmAdmission>> {
+        self.shm_admission.get().map(Arc::clone)
     }
 
     /// Expiry deadline for shard-0 in-flight slots and pending-dial
@@ -989,10 +1059,9 @@ impl IggyMessageBus {
         self.client_meta.borrow().get(&client_id).map(Rc::clone)
     }
 
-    /// Number of live connections of `kind` on this bus. Accurate only
-    /// for the shard that terminates the transport; used by the
-    /// shared-memory accept path to enforce its admission cap, which is
-    /// what keeps that transport shard-0 terminal today.
+    /// Number of live connections of `kind` on this bus. Counts only
+    /// the connections this shard terminates; process-wide shm
+    /// admission is accounted by [`ShmAdmission`] instead.
     #[must_use]
     pub fn client_transport_count(&self, kind: ClientTransportKind) -> usize {
         self.client_meta
@@ -1007,7 +1076,13 @@ impl IggyMessageBus {
     }
 
     pub(crate) fn remove_client_meta(&self, client_id: u128) {
-        if self.client_meta.borrow_mut().remove(&client_id).is_some() {
+        let removed = self.client_meta.borrow_mut().remove(&client_id);
+        if let Some(meta) = removed {
+            if meta.transport == ClientTransportKind::Shm
+                && let Some(admission) = self.shm_admission.get()
+            {
+                admission.release();
+            }
             self.notify_client_connection_lost(client_id);
         }
     }

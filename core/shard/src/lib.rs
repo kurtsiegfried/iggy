@@ -651,6 +651,15 @@ pub enum LifecycleFrame {
     /// Shard 0 therefore terminates QUIC locally and uses the existing
     /// `ForwardClientSend` variant for outbound traffic.
     ClientWsConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
+    /// Shard 0 distributes an inbound shared-memory client's
+    /// pre-handshake unix-socket fd to the owning shard. Only the
+    /// socket crosses shards: the HELLO/WELCOME handshake runs on the
+    /// receiving shard, which is therefore where the segment is
+    /// allocated, sealed, and mapped, so the non-portable log state
+    /// never exists anywhere else. Owning shard is encoded in the top
+    /// 16 bits of `meta.client_id`. Admission against the `[shm]`
+    /// connection cap already happened on shard 0.
+    ClientShmConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
     ForwardReplicaSend {

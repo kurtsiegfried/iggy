@@ -3956,6 +3956,13 @@ mod tests {
             _on_request: RequestHandler,
         ) {
         }
+        fn install_client_shm_fd(
+            &self,
+            _fd: DupedFd,
+            _meta: ClientConnMeta,
+            _on_request: RequestHandler,
+        ) {
+        }
         fn client_meta(&self, _client_id: u128) -> Option<Rc<ClientConnMeta>> {
             None
         }
