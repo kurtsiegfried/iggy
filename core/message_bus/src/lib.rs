@@ -2014,4 +2014,60 @@ mod tests {
             "expired slots must be pruned at cap"
         );
     }
+
+    #[test]
+    fn shm_admission_admits_to_cap_and_readmits_after_release() {
+        let admission = ShmAdmission::default();
+        assert!(admission.try_admit(2));
+        assert!(admission.try_admit(2));
+        assert!(!admission.try_admit(2), "the cap must hold at capacity");
+        assert_eq!(admission.live(), 2);
+
+        admission.release();
+        assert!(
+            admission.try_admit(2),
+            "a released slot must be admittable again"
+        );
+    }
+
+    #[test]
+    fn shm_admission_release_saturates_at_zero() {
+        let admission = ShmAdmission::default();
+        // Teardown of a connection no accept admitted (single-bus tests
+        // drive the install path directly) must not underflow.
+        admission.release();
+        assert_eq!(admission.live(), 0);
+        assert!(admission.try_admit(1));
+        assert!(!admission.try_admit(1));
+    }
+
+    #[test]
+    fn removing_shm_client_meta_releases_the_installed_ledger() {
+        let bus = IggyMessageBus::new(0);
+        let admission = Arc::new(ShmAdmission::default());
+        bus.set_shm_admission(Arc::clone(&admission));
+
+        assert!(admission.try_admit(1));
+        bus.insert_client_meta(Rc::new(ClientConnMeta::new(
+            7,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            ClientTransportKind::Shm,
+        )));
+        bus.remove_client_meta(7);
+        assert_eq!(
+            admission.live(),
+            0,
+            "removing an shm connection's metadata must return its slot"
+        );
+
+        // A non-shm removal must leave the ledger alone.
+        assert!(admission.try_admit(1));
+        bus.insert_client_meta(Rc::new(ClientConnMeta::new(
+            8,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            ClientTransportKind::Tcp,
+        )));
+        bus.remove_client_meta(8);
+        assert_eq!(admission.live(), 1);
+    }
 }
