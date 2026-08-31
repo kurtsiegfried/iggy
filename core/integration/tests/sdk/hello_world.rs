@@ -24,7 +24,7 @@ async fn hello_world(harness: &TestHarness) {
     client.ping().await.unwrap();
 }
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic, Shm])]
 async fn hello_world(harness: &TestHarness) {
     let client = harness.new_client().await.unwrap();
     client

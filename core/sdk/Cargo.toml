@@ -58,6 +58,10 @@ tracing = { workspace = true }
 trait-variant = { workspace = true }
 webpki-roots = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+shm = { workspace = true }
+
 [dev-dependencies]
 mockall = { workspace = true }
 

@@ -254,6 +254,9 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
             username,
             password,
         }),
+        TransportProtocol::Shm => {
+            unreachable!("no benchmark subcommand constructs the shm transport yet")
+        }
         TransportProtocol::WebSocket => Arc::new(WebSocketClientFactory {
             server_addr: args.server_address().to_owned(),
             username,

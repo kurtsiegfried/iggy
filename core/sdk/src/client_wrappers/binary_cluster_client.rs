@@ -29,6 +29,8 @@ impl ClusterClient for ClientWrapper {
             ClientWrapper::Quic(client) => client.get_cluster_metadata().await,
             ClientWrapper::Tcp(client) => client.get_cluster_metadata().await,
             ClientWrapper::WebSocket(client) => client.get_cluster_metadata().await,
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => client.get_cluster_metadata().await,
         }
     }
 }

@@ -56,6 +56,12 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
                     .await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
+                client
+                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
+                    .await
+            }
         }
     }
 
@@ -92,6 +98,12 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
+                client
+                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
+                    .await
+            }
         }
     }
 
@@ -124,6 +136,12 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .await
             }
             ClientWrapper::WebSocket(client) => {
+                client
+                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
+                    .await
+            }
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => {
                 client
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await

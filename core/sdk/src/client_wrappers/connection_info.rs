@@ -55,6 +55,11 @@ impl ClientWrapper {
                 protocol: TransportProtocol::WebSocket,
                 server_address: client.current_server_address.lock().await.clone(),
             },
+            #[cfg(unix)]
+            ClientWrapper::Shm(client) => ConnectionInfo {
+                protocol: TransportProtocol::Shm,
+                server_address: client.current_server_address.lock().await.clone(),
+            },
         }
     }
 }

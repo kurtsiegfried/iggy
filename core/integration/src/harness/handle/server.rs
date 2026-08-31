@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
 use std::time::{Duration, Instant};
 use toml::Value;
@@ -49,6 +49,7 @@ struct ServerProtocolAddr {
     http: Option<SocketAddr>,
     quic: Option<SocketAddr>,
     websocket: Option<SocketAddr>,
+    shm: Option<PathBuf>,
 }
 
 impl ServerProtocolAddr {
@@ -58,9 +59,15 @@ impl ServerProtocolAddr {
             http: None,
             quic: None,
             websocket: None,
+            shm: None,
         }
     }
 }
+
+/// Disambiguates shm socket paths between servers inside one test
+/// process; the process id in the path handles cross-process collisions
+/// under nextest.
+static SHM_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct ServerHandle {
     server_id: u32,
@@ -121,6 +128,10 @@ impl ServerHandle {
 
     pub fn websocket_addr(&self) -> Option<SocketAddr> {
         self.addrs.websocket
+    }
+
+    pub fn shm_socket(&self) -> Option<&Path> {
+        self.addrs.shm.as_deref()
     }
 
     pub fn data_path(&self) -> PathBuf {
@@ -250,12 +261,18 @@ impl ServerHandle {
         Ok(self.client_builder(TransportProtocol::WebSocket))
     }
 
+    /// Returns a shared-memory `ClientBuilder`. Call `.connect()` to create the client.
+    pub fn shm_client(&self) -> Result<ClientBuilder, TestBinaryError> {
+        Ok(self.client_builder(TransportProtocol::Shm))
+    }
+
     fn client_builder(&self, transport: TransportProtocol) -> ClientBuilder {
         let connection = ServerConnection {
             tcp_addr: self.addrs.tcp,
             http_addr: self.addrs.http,
             quic_addr: self.addrs.quic,
             websocket_addr: self.addrs.websocket,
+            shm_socket: self.addrs.shm.clone(),
             tls: self.config.tls.clone(),
             websocket_tls: self.config.websocket_tls.clone(),
             tls_ca_cert_path: self.tls_ca_cert_path(),
@@ -271,6 +288,8 @@ impl ServerHandle {
             "IGGY_HTTP_ADDRESS",
             "IGGY_QUIC_ADDRESS",
             "IGGY_WEBSOCKET_ADDRESS",
+            "IGGY_SHM_ENABLED",
+            "IGGY_SHM_SOCKET",
         ];
 
         for (key, value) in std::env::vars() {
@@ -325,6 +344,13 @@ impl ServerHandle {
             self.envs
                 .entry("IGGY_HTTP_ENABLED".to_string())
                 .or_insert_with(|| "false".to_string());
+        }
+        // Inverted against the siblings: the server ships with shm
+        // disabled, so tests opt in rather than out.
+        if self.config.shm_enabled {
+            self.envs
+                .entry("IGGY_SHM_ENABLED".to_string())
+                .or_insert_with(|| "true".to_string());
         }
 
         // Encryption (special handling for key injection)
@@ -381,6 +407,8 @@ impl ServerHandle {
     }
 
     fn set_protocol_addresses(&mut self) -> Result<(), TestBinaryError> {
+        self.set_shm_socket();
+
         // Cluster mode: port reserver and addresses are pre-set by builder
         if self.port_reserver.is_some() {
             debug_assert!(
@@ -447,6 +475,36 @@ impl ServerHandle {
 
         self.port_reserver = Some(reserver);
         Ok(())
+    }
+
+    /// Pin the shm socket path once shm is enabled in the final env set.
+    /// An explicit `IGGY_SHM_SOCKET` (test attribute) wins; a restart
+    /// reuses the path of the previous run; otherwise a fresh path is
+    /// generated under the system temp dir, which stays short enough
+    /// for `sun_path` where the per-test data directories do not.
+    fn set_shm_socket(&mut self) {
+        let enabled = self
+            .envs
+            .get("IGGY_SHM_ENABLED")
+            .is_some_and(|value| value == "true");
+        if !enabled {
+            return;
+        }
+        if let Some(explicit) = self.envs.get("IGGY_SHM_SOCKET") {
+            self.addrs.shm = Some(PathBuf::from(explicit));
+            return;
+        }
+        if self.addrs.shm.is_none() {
+            let sequence = SHM_SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            self.addrs.shm = Some(std::env::temp_dir().join(format!(
+                "iggy-shm-{}-{}-{sequence}.sock",
+                std::process::id(),
+                self.server_id
+            )));
+        }
+        let socket = self.addrs.shm.as_ref().expect("assigned above");
+        self.envs
+            .insert("IGGY_SHM_SOCKET".to_string(), socket.display().to_string());
     }
 
     fn wait_for_server_ready(&mut self) -> Result<(), TestBinaryError> {
@@ -1054,6 +1112,12 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        // The server never unlinks its socket on shutdown (a restart
+        // rebinds over it); without this the temp dir accretes one
+        // socket file per test server.
+        if let Some(shm_socket) = &self.addrs.shm {
+            let _ = fs::remove_file(shm_socket);
+        }
         if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
             if std::thread::panicking() {
                 // Ahead of the full dump, which buries these lines under the

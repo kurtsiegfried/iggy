@@ -106,6 +106,7 @@ async fn pinned_producer(
         TransportProtocol::Quic => node.quic_addr(),
         TransportProtocol::WebSocket => node.websocket_addr(),
         TransportProtocol::Http => panic!("HTTP does not expose a persistent Iggy client"),
+        TransportProtocol::Shm => panic!("shm is local-only and never a roster endpoint"),
     }
     .unwrap_or_else(|| panic!("leader exposes a {transport} endpoint"))
     .to_string();
@@ -114,6 +115,7 @@ async fn pinned_producer(
         TransportProtocol::Quic => node.quic_client(),
         TransportProtocol::WebSocket => node.websocket_client(),
         TransportProtocol::Http => panic!("HTTP does not expose a persistent Iggy client"),
+        TransportProtocol::Shm => panic!("shm is local-only and never a roster endpoint"),
     }
     .unwrap_or_else(|error| panic!("leader exposes a {transport} client: {error}"));
     let builder = match reestablish_after {

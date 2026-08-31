@@ -18,6 +18,8 @@
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::quic::quic_client::QuicClient;
+#[cfg(unix)]
+use crate::shm::shm_client::ShmClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 
@@ -29,4 +31,6 @@ pub enum ClientWrapper {
     Tcp(TcpClient),
     Quic(QuicClient),
     WebSocket(WebSocketClient),
+    #[cfg(unix)]
+    Shm(ShmClient),
 }

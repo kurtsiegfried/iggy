@@ -81,18 +81,7 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
             return Err(IggyError::InvalidConnectionString);
         }
 
-        if !server_address.contains(':') || server_address.starts_with(':') {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        let port = server_address.split(':').collect::<Vec<&str>>()[1];
-        if port.is_empty() {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        if port.parse::<u16>().is_err() {
-            return Err(IggyError::InvalidConnectionString);
-        }
+        T::validate_server_address(server_address)?;
 
         let connection_string_options;
         if let Some(options) = server_and_options.get(1) {

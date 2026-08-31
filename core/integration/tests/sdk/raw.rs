@@ -22,7 +22,7 @@ use iggy_binary_protocol::codes::{GET_STATS_CODE, LOGIN_USER_CODE, PING_CODE};
 use iggy_binary_protocol::requests::system::{GetStatsRequest, PingRequest};
 use integration::iggy_harness;
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic, Shm])]
 async fn given_authenticated_client_when_sending_raw_request_should_round_trip(
     harness: &TestHarness,
 ) {

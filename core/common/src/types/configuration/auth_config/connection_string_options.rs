@@ -25,4 +25,24 @@ pub trait ConnectionStringOptions {
     fn parse_options(options: &str) -> Result<Self, IggyError>
     where
         Self: Sized;
+
+    /// Validate the address part of a connection string for this transport.
+    /// Network transports expect `host:port`; path-addressed transports
+    /// override this with their own grammar.
+    fn validate_server_address(server_address: &str) -> Result<(), IggyError> {
+        if !server_address.contains(':') || server_address.starts_with(':') {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        let port = server_address.split(':').collect::<Vec<&str>>()[1];
+        if port.is_empty() {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        if port.parse::<u16>().is_err() {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        Ok(())
+    }
 }

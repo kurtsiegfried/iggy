@@ -59,6 +59,14 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence(harness
     single_message_per_batch_scenario::run(harness, 5).await;
 }
 
+// Shm is excluded on a server-side gap: the local socket lets the client
+// reconnect within about a second of the restart, its first send lands while
+// the partitions plane is still recovering, and the recovery-window view
+// change can move the group's primary to a replica on another shard. Requests
+// entering through the shard-0 shm connection then keep reaching a follower
+// replica, which refuses them, and unlike the network transports there is no
+// other node to walk to. Re-enable once locally entered partition requests
+// follow the elected primary across shards.
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
@@ -73,8 +81,9 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
 // QUIC is excluded on an SDK gap: after the restart the QUIC client redirects
 // to the new leader, reconnects, and signs in, but the long-lived consumer's
 // polls then return nothing for the whole window -- the post-reconnect request
-// path wedges (QUIC also lacks the TCP client's mid-connection failover). TCP
-// and WebSocket run.
+// path wedges (QUIC also lacks the TCP client's mid-connection failover). Shm
+// is excluded for the reason on the producer variant above. TCP and WebSocket
+// run.
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket],
     server(
