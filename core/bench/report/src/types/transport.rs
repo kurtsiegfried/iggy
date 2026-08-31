@@ -33,4 +33,7 @@ pub enum BenchmarkTransport {
     #[display("WEBSOCKET")]
     #[serde(rename = "websocket")]
     WebSocket,
+    #[display("SHM")]
+    #[serde(rename = "shm")]
+    Shm,
 }
