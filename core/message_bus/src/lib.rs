@@ -439,6 +439,23 @@ pub type AcceptedTlsClientFn =
 pub type AcceptedWssClientFn =
     std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
 
+/// Callback invoked on every accepted shared-memory client connection.
+///
+/// Fires after shard 0's unix-socket listener accepts a stream. No
+/// handshake has run yet — the listener stays cheap so a slow peer
+/// cannot block subsequent accepts. The callback enforces the
+/// `shm.max_connections` admission cap, mints a `client_id`, and calls
+/// [`installer::install_client_shm`]; the install path drives the
+/// HELLO/WELCOME handshake and segment setup on its own task, bounded
+/// by `handshake_grace`, before entering the pump.
+///
+/// Shared-memory stays shard-0 terminal for now: the admission cap
+/// needs an accurately countable connection population, which only a
+/// single shard's registry provides today. The segment fd itself is
+/// dupable and portable, so round-robin delegation (the plain-TCP
+/// model) remains open once a cross-shard connection count exists.
+pub type AcceptedShmClientFn = std::rc::Rc<dyn Fn(compio::net::UnixStream)>;
+
 /// Notifier fired when a delegated replica connection dies.
 ///
 /// The delegated replica connection's writer / reader tasks invoke this on
@@ -970,6 +987,19 @@ impl IggyMessageBus {
     #[must_use]
     pub fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {
         self.client_meta.borrow().get(&client_id).map(Rc::clone)
+    }
+
+    /// Number of live connections of `kind` on this bus. Accurate only
+    /// for the shard that terminates the transport; used by the
+    /// shared-memory accept path to enforce its admission cap, which is
+    /// what keeps that transport shard-0 terminal today.
+    #[must_use]
+    pub fn client_transport_count(&self, kind: ClientTransportKind) -> usize {
+        self.client_meta
+            .borrow()
+            .values()
+            .filter(|meta| meta.transport == kind)
+            .count()
     }
 
     pub(crate) fn insert_client_meta(&self, meta: Rc<ClientConnMeta>) {

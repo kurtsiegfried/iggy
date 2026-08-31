@@ -34,6 +34,7 @@ mod common;
 pub mod conn_info;
 pub mod quic;
 pub mod replica;
+pub mod shm;
 pub mod tcp;
 pub mod tcp_tls;
 pub mod ws;
@@ -41,6 +42,7 @@ pub mod wss;
 
 pub use quic::install_client_quic;
 pub use replica::{install_replica_conn, install_replica_inbound, install_replica_outbound};
+pub use shm::install_client_shm;
 pub use tcp::{install_client_conn, install_client_tcp};
 pub use tcp_tls::install_client_tcp_tls;
 pub use ws::install_client_ws;

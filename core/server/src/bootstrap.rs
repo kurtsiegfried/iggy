@@ -72,9 +72,10 @@ use message_bus::transports::tls::{
     load_ca_pem, load_pem, self_signed_for_loopback,
 };
 use message_bus::{
-    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller, DialedReplicaFn, IggyMessageBus,
-    MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus, ReplicaOwnerTable, connector,
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedShmClientFn,
+    AcceptedTlsClientFn, AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller,
+    DialedReplicaFn, IggyMessageBus, MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus,
+    ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -553,6 +554,7 @@ struct LocalClientAcceptFns {
     quic: AcceptedQuicClientFn,
     tcp_tls: AcceptedTlsClientFn,
     wss: AcceptedWssClientFn,
+    shm: AcceptedShmClientFn,
 }
 
 #[derive(Default)]
@@ -3126,6 +3128,7 @@ async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
     shard_metrics_all: &[ShardMetrics],
 ) -> Result<(), ServerError> {
+    let shm_accept = Rc::clone(&accepted_clients.shm);
     if config.tcp.enabled && !config.tcp.tls.enabled {
         start_via_replica_io(
             shard,
@@ -3146,6 +3149,19 @@ async fn start_tcp_runtime(
             accepted_clients,
         )
         .await?;
+    }
+
+    // Shared memory rides its own unix socket outside the TCP reactor,
+    // so it binds independently, like HTTP below. Shard-0 gating comes
+    // from the sole caller of this function.
+    if config.shm.enabled {
+        let socket_path = std::path::PathBuf::from(&config.shm.socket);
+        let listener = message_bus::client_listener::shm::bind(&socket_path).await?;
+        let token = shard.bus.token();
+        let handle = compio::runtime::spawn(async move {
+            message_bus::client_listener::shm::run(listener, token, shm_accept).await;
+        });
+        shard.bus.track_background(handle);
     }
 
     // HTTP is served over TCP but sits outside the replica_io / manual client
@@ -3220,6 +3236,9 @@ async fn start_via_replica_io(
         quic,
         tcp_tls,
         wss,
+        // Bound independently in `start_tcp_runtime`; the reactor does
+        // not carry the unix-socket listener.
+        shm: _,
     } = accepted_clients;
 
     let bound = replica_io::start_on_shard_zero(
@@ -3611,8 +3630,10 @@ fn make_shard_zero_client_accept_fns(
     let quic_bus = Rc::clone(bus);
     let tcp_tls_bus = Rc::clone(bus);
     let wss_bus = Rc::clone(bus);
+    let shm_bus = Rc::clone(bus);
     let quic_request = on_request.clone();
     let wss_request = on_request.clone();
+    let shm_request = on_request.clone();
     let tcp_tls_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
@@ -3658,7 +3679,7 @@ fn make_shard_zero_client_accept_fns(
     // WSS terminates locally on shard 0 like TCP-TLS (rustls state is not
     // serialisable across the delegate path), minting ids through the same
     // coordinator counter.
-    let wss_coord = coord;
+    let wss_coord = Rc::clone(&coord);
     let wss = Rc::new(move |stream, tls_config| {
         let Some(meta) = client_meta_from_stream(&stream, &wss_coord, ClientTransportKind::Wss)
         else {
@@ -3667,12 +3688,31 @@ fn make_shard_zero_client_accept_fns(
         installer::install_client_wss(&wss_bus, meta, stream, tls_config, wss_request.clone());
     });
 
+    // Shared memory terminates locally on shard 0: the accept-time
+    // connection cap needs an accurately countable population, which
+    // only one shard's registry provides. A unix socket has no inet
+    // peer address, so the meta records a loopback placeholder; peer
+    // identity lives in the segment's control page.
+    let shm_coord = coord;
+    let shm = Rc::new(move |stream: compio::net::UnixStream| {
+        let cap = shm_bus.config().shm.max_connections;
+        let live = shm_bus.client_transport_count(ClientTransportKind::Shm);
+        if live >= cap {
+            warn!(live, cap, "shm connection refused: max_connections reached");
+            return;
+        }
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let meta = mint_client_meta(&shm_coord, peer_addr, ClientTransportKind::Shm);
+        installer::install_client_shm(&shm_bus, meta, stream, shm_request.clone());
+    });
+
     LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
         wss,
+        shm,
     }
 }
 

@@ -30,6 +30,7 @@ pub mod partition;
 pub mod quic;
 pub mod server;
 pub mod sharding;
+pub mod shm;
 pub mod tcp;
 pub mod validators;
 pub mod websocket;

@@ -193,6 +193,58 @@ pub struct MessageBusConfig {
     /// QUIC transport tuning, pre-converted from
     /// [`ServerConfig::quic`](configs::quic::QuicConfig) at boot.
     pub quic: QuicTuning,
+
+    /// Shared-memory transport tuning, pre-converted from
+    /// [`ServerConfig::shm`](configs::shm::ShmConfig) at boot. Present
+    /// even when the listener is disabled so test buses can install
+    /// shared-memory connections without a full server config.
+    pub shm: ShmTuning,
+}
+
+/// Fixed cadence of the shared-memory pump's housekeeping tick. Not
+/// operator-exposed; tests override through [`ShmTuning`].
+pub const DEFAULT_SHM_HEARTBEAT_TICK: Duration = Duration::from_secs(1);
+
+/// Fixed progress deadline for shared-memory clients.
+///
+/// A connection showing no frames and no heartbeat-word changes for
+/// this long is torn down, because an idle-forever client would
+/// otherwise pin its segment and admission slot with no in-band
+/// recovery. Not operator-exposed; tests override through
+/// [`ShmTuning`].
+pub const DEFAULT_SHM_CLIENT_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// Runtime shape of the `[shm]` section plus the fixed liveness
+/// constants, converted once at boot so the install path does no
+/// per-connection parsing.
+#[derive(Debug, Clone)]
+pub struct ShmTuning {
+    /// Capacity of one log region; both directions use the same value.
+    pub region_capacity: usize,
+    /// Wire-level cap on a single frame carried in the logs.
+    pub max_message_size: usize,
+    /// Accept-side cap on concurrent shared-memory connections.
+    pub max_connections: usize,
+    /// Pump housekeeping cadence; see [`DEFAULT_SHM_HEARTBEAT_TICK`].
+    pub heartbeat_tick: Duration,
+    /// Client progress deadline; see
+    /// [`DEFAULT_SHM_CLIENT_STALE_AFTER`].
+    pub client_stale_after: Duration,
+}
+
+impl Default for ShmTuning {
+    fn default() -> Self {
+        // Hand-coded literals pinned against the schema-derived path by
+        // `shm_tuning_default_matches_schema` below, same contract as
+        // `QuicTuning::default()`.
+        Self {
+            region_capacity: 8 * 1024 * 1024,
+            max_message_size: 4_000_000,
+            max_connections: 32,
+            heartbeat_tick: DEFAULT_SHM_HEARTBEAT_TICK,
+            client_stale_after: DEFAULT_SHM_CLIENT_STALE_AFTER,
+        }
+    }
 }
 
 impl From<&ServerConfig> for MessageBusConfig {
@@ -225,7 +277,22 @@ impl From<&ServerConfig> for MessageBusConfig {
             handshake_grace: bus.handshake_grace.get_duration(),
             ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
+            shm: build_shm_tuning(&cfg.shm),
         }
+    }
+}
+
+/// Convert the schema's [`configs::shm::ShmConfig`] into the runtime
+/// [`ShmTuning`]. Range invariants (power-of-two region within the
+/// layout bounds, frame cap within half a region) are enforced by
+/// `ShmConfig::validate()` at boot.
+fn build_shm_tuning(shm: &configs::shm::ShmConfig) -> ShmTuning {
+    ShmTuning {
+        region_capacity: byte_size_to_usize(shm.region_capacity),
+        max_message_size: byte_size_to_usize(shm.max_message_size),
+        max_connections: shm.max_connections as usize,
+        heartbeat_tick: DEFAULT_SHM_HEARTBEAT_TICK,
+        client_stale_after: DEFAULT_SHM_CLIENT_STALE_AFTER,
     }
 }
 
@@ -322,6 +389,17 @@ impl Default for MessageBusConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same drift contract as `quic_tuning_default_matches_schema`,
+    /// for the shared-memory tuning literals.
+    #[test]
+    fn shm_tuning_default_matches_schema() {
+        let schema_shm = MessageBusConfig::from(&ServerConfig::default()).shm;
+        let literal = ShmTuning::default();
+        assert_eq!(schema_shm.region_capacity, literal.region_capacity);
+        assert_eq!(schema_shm.max_message_size, literal.max_message_size);
+        assert_eq!(schema_shm.max_connections, literal.max_connections);
+    }
 
     /// `QuicTuning::default()` carries hand-coded literals that must
     /// match the schema-derived path through

@@ -76,6 +76,7 @@
 //! `transports/{tcp,tcp_tls,ws,wss,quic}.rs`.
 
 pub mod quic;
+pub mod shm;
 pub mod tcp;
 pub mod tcp_tls;
 pub mod tls;
