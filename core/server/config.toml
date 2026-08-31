@@ -912,9 +912,17 @@ enabled = false
 # nested runtime directories.
 socket = "local_data/runtime/iggy-shm.sock"
 
-# Capacity of one log region. Each direction of a connection maps
-# three regions, so one connection pins about six times this value in
-# memory. Must be a power of two within 64 KiB..=1 GiB.
+# Capacity of one log region. This is the per-connection memory knob:
+# a connection's segment is a 4 KiB control page plus, per direction,
+# a 512-byte counters block and three regions, so about six times this
+# value (48 MiB at the default). The segment is shared memory, mapped
+# by the server and the client but counted once. On Linux it is
+# fallocated at the handshake, so the full amount is committed the
+# moment a connection is admitted; elsewhere it stays sparse and
+# becomes resident as traffic touches it, reaching the full size after
+# one complete rotation in each direction. Must be a power of two
+# within 64 KiB..=1 GiB; smaller regions cost proportionally more
+# rotation work per byte and cap max_message_size.
 region_capacity = "8 MiB"
 
 # Largest wire frame accepted over shared memory. A frame must fit in
@@ -926,7 +934,11 @@ max_message_size = "4 MB"
 
 # Cap on concurrent shared-memory connections, enforced at accept.
 # Each connection pins real memory (see region_capacity), so unlike
-# TCP the accept loop refuses connections past the cap.
+# TCP the accept loop refuses connections past the cap. Total segment
+# memory is bounded by max_connections x ~6 x region_capacity, about
+# 1.5 GiB at the defaults; beyond the segments a connection costs the
+# server one pump task, a scratch buffer up to max_message_size, and
+# two fds, and costs the client one dedicated I/O thread.
 max_connections = 32
 
 # Metadata consensus plane tunables (shard 0's VSR replica: users,
