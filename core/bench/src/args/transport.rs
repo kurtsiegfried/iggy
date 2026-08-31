@@ -17,8 +17,8 @@
 
 use super::defaults::{
     DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
-    DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_TCP_SERVER_ADDRESS,
-    DEFAULT_WEBSOCKET_SERVER_ADDRESS,
+    DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_SHM_SOCKET,
+    DEFAULT_TCP_SERVER_ADDRESS, DEFAULT_WEBSOCKET_SERVER_ADDRESS,
 };
 use super::{output::BenchmarkOutputCommand, props::BenchmarkTransportProps};
 use clap::{Parser, Subcommand};
@@ -32,6 +32,7 @@ pub enum BenchmarkTransportCommand {
     Quic(QuicArgs),
     #[command(alias = "ws")]
     WebSocket(WebSocketArgs),
+    Shm(ShmArgs),
 }
 
 impl Serialize for BenchmarkTransportCommand {
@@ -44,6 +45,7 @@ impl Serialize for BenchmarkTransportCommand {
             Self::Tcp(_) => "tcp",
             Self::Quic(_) => "quic",
             Self::WebSocket(_) => "websocket",
+            Self::Shm(_) => "shm",
         };
         serializer.serialize_str(variant_str)
     }
@@ -76,6 +78,7 @@ impl BenchmarkTransportProps for BenchmarkTransportCommand {
             Self::Tcp(args) => args,
             Self::Quic(args) => args,
             Self::WebSocket(args) => args,
+            Self::Shm(args) => args,
         }
     }
 
@@ -257,6 +260,43 @@ impl BenchmarkTransportProps for WebSocketArgs {
 
     fn nodelay(&self) -> bool {
         panic!("Setting nodelay for WebSocket transport is not supported!")
+    }
+
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct ShmArgs {
+    /// Path of the iggy-server's shared-memory unix socket
+    #[arg(long, default_value_t = DEFAULT_SHM_SOCKET.to_owned())]
+    pub socket: String,
+
+    /// Optional output command, used to output results (charts, raw json data) to a directory
+    #[command(subcommand)]
+    pub output: Option<BenchmarkOutputCommand>,
+}
+
+impl BenchmarkTransportProps for ShmArgs {
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Shm
+    }
+
+    fn server_address(&self) -> &str {
+        &self.socket
+    }
+
+    fn validate_certificate(&self) -> bool {
+        panic!("Cannot validate certificate for shm transport!")
+    }
+
+    fn client_address(&self) -> &str {
+        panic!("Setting client address for shm transport is not supported!")
+    }
+
+    fn nodelay(&self) -> bool {
+        panic!("Setting nodelay for shm transport is not supported!")
     }
 
     fn output_command(&self) -> Option<&BenchmarkOutputCommand> {

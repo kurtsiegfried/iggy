@@ -30,6 +30,8 @@ pub const DEFAULT_QUIC_VALIDATE_CERTIFICATE: bool = false;
 
 pub const DEFAULT_WEBSOCKET_SERVER_ADDRESS: &str = "127.0.0.1:8092";
 
+pub const DEFAULT_SHM_SOCKET: &str = "local_data/runtime/iggy-shm.sock";
+
 pub const DEFAULT_MESSAGES_PER_BATCH: NonZeroU32 = u32!(1000);
 pub const DEFAULT_MESSAGE_BATCHES: NonZeroU32 = u32!(1000);
 pub const DEFAULT_MESSAGE_SIZE: NonZeroU32 = u32!(1000);

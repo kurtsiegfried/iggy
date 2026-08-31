@@ -24,6 +24,8 @@ use iggy::prelude::{
     TcpClientConfig, TransportProtocol, UserClient, WebSocketClientConfig,
 };
 use iggy::quic::quic_client::QuicClient;
+#[cfg(unix)]
+use iggy::shm::shm_client::ShmClient;
 use iggy::websocket::websocket_client::WebSocketClient;
 use std::sync::Arc;
 
@@ -222,6 +224,51 @@ impl ClientFactory for WebSocketClientFactory {
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct ShmClientFactory {
+    pub socket_path: String,
+    pub username: String,
+    pub password: String,
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl ClientFactory for ShmClientFactory {
+    async fn create_client(&self) -> ClientWrapper {
+        let config = iggy::prelude::ShmClientConfig {
+            server_address: self.socket_path.clone(),
+            ..iggy::prelude::ShmClientConfig::default()
+        };
+        let client = ShmClient::create(Arc::new(config)).unwrap();
+        Client::connect(&client).await.unwrap_or_else(|e| {
+            panic!(
+                "Failed to connect to iggy-server over shm socket {}, error: {:?}\n\
+                Hint: start the server with the [shm] transport enabled \
+                (IGGY_SHM_ENABLED=true) and a matching IGGY_SHM_SOCKET path.",
+                self.socket_path, e
+            )
+        });
+        ClientWrapper::Shm(client)
+    }
+
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Shm
+    }
+
+    fn server_addr(&self) -> String {
+        self.socket_path.clone()
+    }
+
+    fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn password(&self) -> &str {
+        &self.password
+    }
+}
+
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
     let username = args.username().to_owned();
     let password = args.password().to_owned();
@@ -254,8 +301,15 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
             username,
             password,
         }),
+        #[cfg(unix)]
+        TransportProtocol::Shm => Arc::new(ShmClientFactory {
+            socket_path: args.server_address().to_owned(),
+            username,
+            password,
+        }),
+        #[cfg(not(unix))]
         TransportProtocol::Shm => {
-            unreachable!("no benchmark subcommand constructs the shm transport yet")
+            panic!("the shm transport requires a unix platform")
         }
         TransportProtocol::WebSocket => Arc::new(WebSocketClientFactory {
             server_addr: args.server_address().to_owned(),

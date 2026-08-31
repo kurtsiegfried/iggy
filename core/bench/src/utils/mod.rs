@@ -101,9 +101,7 @@ pub fn params_from_args_and_metrics(
         TransportProtocol::Quic => BenchmarkTransport::Quic,
         TransportProtocol::Http => BenchmarkTransport::Http,
         TransportProtocol::WebSocket => BenchmarkTransport::WebSocket,
-        TransportProtocol::Shm => {
-            unreachable!("no benchmark subcommand constructs the shm transport yet")
-        }
+        TransportProtocol::Shm => BenchmarkTransport::Shm,
     };
     let server_address = args.server_address().to_string();
     let remark = args.remark();
